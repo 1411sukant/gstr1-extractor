@@ -130,11 +130,12 @@ def extract_6_1A(file):
                         cells = [str(c).strip() if c else "" for c in row]
                         row_text = " ".join(cells).lower()
 
-                        if "integrated tax" not in row_text:
+                        # Only pick the "Integrated tax" row (it contains full ITC breakup)
+                        if "integrated" not in row_text or "tax" not in row_text:
                             continue
 
                         nums = []
-                        for c in cells[1:]:
+                        for c in cells[1:]:  # skip label column
                             c = c.replace(",", "").strip()
                             if c in ("", "-", "NA"):
                                 nums.append(0.0)
@@ -144,8 +145,9 @@ def extract_6_1A(file):
                                 except:
                                     nums.append(0.0)
 
-                        # CORRECT COLUMN STRUCTURE:
-                        # [Tax Payable, Adjustment, Net, IGST ITC, CGST ITC, SGST ITC, ...]
+                        # Correct structure of row:
+                        # [Tax Payable, Adjustment, Net, IGST ITC, CGST ITC, SGST ITC, Cess, Cash...]
+
                         if len(nums) >= 6:
                             paid_igst = nums[3]
                             paid_cgst = nums[4]
@@ -158,7 +160,6 @@ def extract_6_1A(file):
 
 # ── GSTR-1 PARSER ─────────────────────────────────────────────────────────────
 def parse_gstr1(file) -> dict:
-    # [CHANGE 1 APPLIED]: Fix broken numbers on GSTR-1 text extraction
     text = fix_broken_numbers(pdf_to_text(file))
     month = extract_month(text)
 
@@ -172,7 +173,6 @@ def parse_gstr1(file) -> dict:
     cdn_reg   = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
     cdn_unreg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", r"9C\s*[-–]?\s*Amended", target_word=r"Total\s*[-–]?\s*Net\s+off")
 
-    # [CHANGE 2 APPLIED]: Replaced old 9A logic with extract_9A_amendment function
     amendment_9a = extract_9A_amendment(text)
 
     igst = cgst = sgst = 0.0
@@ -214,7 +214,7 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    # [CHANGE 3 APPLIED]: Replace old 6.1(A) logic with the custom function call
+    # Call the newly extracted function
     paid_igst, paid_cgst, paid_sgst = extract_6_1A(file)
 
     return {
