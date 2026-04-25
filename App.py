@@ -258,17 +258,27 @@ def parse_gstr3b(file) -> dict:
             return 0.0
 
     # ── Method 1: pdfplumber table cells (most accurate) ─────────────────────
+    # CRITICAL FIX: Section (A) and Section (B) are in the SAME table.
+    # We MUST track "in_section_a" row by row and STOP collecting once we
+    # hit "(B) Reverse charge" — otherwise section B's zeros overwrite A's values.
+    #
+    # Column layout (standard GSTR-3B):
+    #  Col 0: Description
+    #  Col 1: Tax payable   Col 2: Adj   Col 3: Net payable
+    #  Col 4: ITC-IGST  Col 5: ITC-CGST  Col 6: ITC-SGST  Col 7: ITC-Cess
+    #  Col 8: Cash  Col 9: Interest  Col 10: Late fee
+    #
+    # Read downward through rows of section (A) only:
+    #  → Integrated tax row  → col 4  (ITC-IGST)
+    #  → Central tax row     → col 5  (ITC-CGST)
+    #  → State/UT tax row    → col 6  (ITC-SGST)
+
     found_via_table = False
     for _pi, tbl in all_tables:
         if not tbl:
             continue
 
-        # Flatten table to detect if it's the 6.1 payment table
-        flat = " ".join(
-            str(c) for row in tbl for c in (row or []) if c
-        ).lower()
-
-        # Must contain both a tax-type label AND numeric-looking content
+        flat = " ".join(str(c) for row in tbl for c in (row or []) if c).lower()
         is_payment_table = (
             "integrated" in flat and
             ("central" in flat or "state" in flat) and
@@ -277,7 +287,7 @@ def parse_gstr3b(file) -> dict:
         if not is_payment_table:
             continue
 
-        # Dynamically detect ITC column positions from header rows
+        # Detect ITC column positions from header rows
         itc_igst_col = 4
         itc_cgst_col = 5
         itc_sgst_col = 6
@@ -287,8 +297,6 @@ def parse_gstr3b(file) -> dict:
             if not row:
                 continue
             cells = [str(c).strip().lower() if c else "" for c in row]
-
-            # Header row detection: find "integrated", "central", "state" after col 3
             for ci, cell in enumerate(cells):
                 if ci <= 3:
                     continue
@@ -299,21 +307,36 @@ def parse_gstr3b(file) -> dict:
                 elif ("state" in cell or "ut" in cell) and "tax" in cell:
                     itc_sgst_col = ci
 
-        # Now extract data rows
+        # ── KEY FIX: track section (A) strictly, stop at section (B) ──────
+        in_section_a = False
         for row in tbl:
             if not row:
                 continue
             cells_raw = [str(c).strip() if c else "" for c in row]
             cells_lo  = [c.lower() for c in cells_raw]
-            first     = cells_lo[0] if cells_lo else ""
+            row_text  = " ".join(cells_lo)
 
+            # Enter section (A)
+            if "other than reverse charge" in row_text:
+                in_section_a = True
+                continue
+
+            # Exit at section (B) — STOP, do not read B rows
+            if in_section_a and "reverse charge" in row_text and "other than" not in row_text:
+                break
+
+            if not in_section_a:
+                continue
+
+            first = cells_lo[0] if cells_lo else ""
             is_igst = "integrated" in first
             is_cgst = "central"    in first and "integrated" not in first
-            is_sgst = ("state" in first or "/ut" in first or "state/ut" in first)
+            is_sgst = "state"      in first or "state/ut"   in first
 
             if not (is_igst or is_cgst or is_sgst):
                 continue
 
+            # Read col 4 → 5 → 6 downward (IGST row → CGST row → SGST row)
             if is_igst:
                 net_payable_igst = safe_float(cells_raw[net_col])      if len(cells_raw) > net_col      else 0.0
                 paid_igst        = safe_float(cells_raw[itc_igst_col]) if len(cells_raw) > itc_igst_col else 0.0
@@ -326,7 +349,7 @@ def parse_gstr3b(file) -> dict:
                 found_via_table = True
 
         if found_via_table:
-            break   # found the right table, stop scanning
+            break
 
     # ── Method 2: text-based fallback (if table method returned all zeros) ───
     if not found_via_table or (paid_igst == 0.0 and paid_cgst == 0.0 and paid_sgst == 0.0):
