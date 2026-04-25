@@ -484,3 +484,4 @@ with st.expander("ℹ️ What's extracted & multi-user info"):
 Multiple team members can extract data simultaneously without any conflict.  
 Deploy on **Streamlit Community Cloud** (free) for a shared link — just push to GitHub.
     """)
+
