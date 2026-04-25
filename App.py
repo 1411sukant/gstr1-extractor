@@ -42,6 +42,24 @@ def pdf_to_text(file) -> str:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
+def fix_broken_numbers(text: str) -> str:
+    """
+    pdfplumber splits numbers across lines in table cells.
+    e.g. '197551.0\n0' → '197551.00'
+         '188641.0\n0' → '188641.00'
+    Fix all such occurrences so regex can find them correctly.
+    """
+    # Pattern: digit(s) + dot + digit(s) + newline + digit(s)
+    # Repeat until no more changes (handles multi-line breaks)
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text)
+    # Also collapse lone digit lines that follow a partial number
+    text = re.sub(r'(\d+)\n(\d{2})\b', r'\1\2', text)
+    return text
+
+
 def find_amounts(text: str, n: int = 1) -> list:
     vals = re.findall(r"-?[\d,]+\.\d{2}", text)
     result = []
@@ -170,43 +188,93 @@ def parse_gstr1(file) -> dict:
 # ── GSTR-3B PARSER ────────────────────────────────────────────────────────────
 
 def parse_gstr3b(file) -> dict:
-    text = pdf_to_text(file)
+    raw_text = pdf_to_text(file)
+    # Fix pdfplumber's broken numbers BEFORE any parsing
+    text  = fix_broken_numbers(raw_text)
     month = extract_month(text)
 
-    # 3.1(d) — RCM: taxable, igst, cgst, sgst, cess
+    # ── 3.1(d) — RCM ─────────────────────────────────────────────────────────
     rcm = row_amounts(text,
         r"\(d\)\s+Inward supplies\s*\(liable to reverse charge\)",
         r"\(e\)\s+Non.GST", count=5)
 
-    # 4(C) — Net ITC Available: igst, cgst, sgst, cess
+    # ── 4(C) — Net ITC Available ──────────────────────────────────────────────
     itc = row_amounts(text,
         r"C\.\s+Net ITC available\s*\(A[-–]?B\)",
         r"\(D\)\s+Other Details", count=4)
 
-    # 6.1(A) — Tax paid via ITC
-    # Row structure per tax type: payable | adj | net_payable | ITC_used | cash | ...
-    # We need position [3] = ITC used for each row (IGST, CGST, SGST)
+    # ── 6.1(A) — Tax paid via ITC ─────────────────────────────────────────────
+    # Each liability row: payable | adj | net | ITC-IGST | ITC-CGST | ITC-SGST | ITC-Cess | Cash | ...
+    # "-" cells are skipped by find_amounts, so positions shift.
+    # IGST row has dashes only after position 5, so [3]=ITC-IGST, [4]=ITC-CGST (or cash if dash)
+    #
+    # Strategy: extract all numbers from each row, then use pdfplumber table
+    # as ground truth to count exactly which column is ITC IGST/CGST/SGST.
+
     paid_igst = paid_cgst = paid_sgst = 0.0
 
-    sec_a = re.search(r"\(A\)\s+Other\s+than\s+reverse\s+charge", text, re.IGNORECASE)
-    sec_b = re.search(r"\(B\)\s+Reverse\s+charge",                text, re.IGNORECASE)
+    # First try: pdfplumber table extraction (most reliable for structured tables)
+    try:
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for tbl in tables:
+                    for row in tbl:
+                        if row is None:
+                            continue
+                        cells = [str(c).strip() if c else "" for c in row]
+                        row_text = " ".join(cells).lower()
 
-    if sec_a:
-        a_start = sec_a.start()
-        a_end   = sec_b.start() if sec_b else a_start + 900
-        chunk   = text[a_start:a_end]
+                        # Identify which tax row this is
+                        is_igst = "integrated" in row_text and "tax" in row_text
+                        is_cgst = "central" in row_text and "tax" in row_text and "integrated" not in row_text
+                        is_sgst = ("state" in row_text or "ut" in row_text) and "tax" in row_text
 
-        def itc_from_row(row_pattern):
-            rm = re.search(row_pattern, chunk, re.IGNORECASE)
-            if not rm:
-                return 0.0
-            # grab 4 numbers after the row label; position [3] is ITC used
-            v = find_amounts(chunk[rm.start(): rm.start() + 400], 4)
-            return v[3] if len(v) >= 4 else 0.0
+                        if not (is_igst or is_cgst or is_sgst):
+                            continue
 
-        paid_igst = itc_from_row(r"Integrated\s*\n?\s*tax")
-        paid_cgst = itc_from_row(r"Central\s*\n?\s*tax")
-        paid_sgst = itc_from_row(r"State/UT\s*\n?\s*tax")
+                        # Collect only numeric cells
+                        nums = []
+                        for c in cells:
+                            c_clean = c.replace(",", "").strip()
+                            try:
+                                nums.append(float(c_clean))
+                            except ValueError:
+                                pass  # skip dashes and blanks
+
+                        # Row layout (ignoring dashes):
+                        # [0]=payable [1]=adj [2]=net [3]=ITC-IGST [4]=ITC-CGST [5]=ITC-SGST ...
+                        if is_igst and len(nums) >= 4:
+                            paid_igst = nums[3]
+                        elif is_cgst and len(nums) >= 4:
+                            paid_cgst = nums[3]
+                        elif is_sgst and len(nums) >= 4:
+                            paid_sgst = nums[3]
+    except Exception:
+        pass  # fall through to text-based method
+
+    # Fallback: text-based extraction on cleaned text
+    if paid_igst == 0.0 and paid_cgst == 0.0 and paid_sgst == 0.0:
+        sec_a = re.search(r"\(A\)\s+Other\s+than\s+reverse\s+charge", text, re.IGNORECASE)
+        sec_b = re.search(r"\(B\)\s+Reverse\s+charge",                text, re.IGNORECASE)
+
+        if sec_a:
+            a_start = sec_a.start()
+            a_end   = sec_b.start() if sec_b else a_start + 1200
+            chunk   = text[a_start:a_end]
+
+            def itc_from_row(row_re):
+                rm = re.search(row_re, chunk, re.IGNORECASE | re.DOTALL)
+                if not rm:
+                    return 0.0
+                # After row label: payable | adj | net | **ITC-IGST** | ...
+                v = find_amounts(chunk[rm.start(): rm.start() + 600], 6)
+                # Position [3] = ITC-IGST column (first ITC sub-column)
+                return v[3] if len(v) >= 4 else 0.0
+
+            paid_igst = itc_from_row(r"Integrated\s+tax")
+            paid_cgst = itc_from_row(r"Central\s+tax")
+            paid_sgst = itc_from_row(r"State/UT\s+tax")
 
     return {
         "Month":          month,
@@ -220,10 +288,10 @@ def parse_gstr3b(file) -> dict:
         "ITC IGST":       itc[0],
         "ITC CGST":       itc[1],
         "ITC SGST":       itc[2],
-        # 6.1(A)
-        "Paid ITC IGST":  paid_igst,
-        "Paid ITC CGST":  paid_cgst,
-        "Paid ITC SGST":  paid_sgst,
+        # 6.1(A) — ITC used per tax head
+        "6.1A IGST via ITC": paid_igst,
+        "6.1A CGST via ITC": paid_cgst,
+        "6.1A SGST via ITC": paid_sgst,
     }
 
 
@@ -278,7 +346,7 @@ def build_excel(gstr1_rows: list, gstr3b_rows: list) -> bytes:
         write_table(ws3, "4(C) – Net ITC Available (A – B)",
                     df3[["Month","File","ITC IGST","ITC CGST","ITC SGST"]], 1)
         write_table(ws4, "6.1(A) – Tax Paid through ITC",
-                    df3[["Month","File","Paid ITC IGST","Paid ITC CGST","Paid ITC SGST"]], 1)
+                    df3[["Month","File","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]], 1)
         for ws in (ws2, ws3, ws4):
             for i in range(1, 8):
                 ws.column_dimensions[get_column_letter(i)].width = 22
@@ -348,7 +416,7 @@ if st.button("⚡ Extract & Download Excel", type="primary",
                      use_container_width=True)
 
         st.markdown("### 6.1(A) — Tax Paid via ITC")
-        paid_df = df3[["Month","File","Paid ITC IGST","Paid ITC CGST","Paid ITC SGST"]]
+        paid_df = df3[["Month","File","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]]
         st.dataframe(paid_df.style.format({c: "₹{:,.2f}" for c in paid_df.columns if c not in ("Month","File")}),
                      use_container_width=True)
 
@@ -377,4 +445,5 @@ with st.expander("ℹ️ What's extracted & multi-user info"):
 Multiple team members can extract data simultaneously without any conflict.  
 Deploy on **Streamlit Community Cloud** (free) for a shared link — just push to GitHub.
     """)
+
         
