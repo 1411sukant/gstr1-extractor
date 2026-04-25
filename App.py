@@ -119,40 +119,38 @@ def extract_6_1A(file):
 
     try:
         with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-
-                for tbl in tables:
-                    for row in tbl:
-                        if not row:
-                            continue
-
-                        cells = [str(c).strip() if c else "" for c in row]
-                        row_text = " ".join(cells).lower()
-
-                        # Only pick the "Integrated tax" row (it contains full ITC breakup)
-                        if "integrated" not in row_text or "tax" not in row_text:
-                            continue
-
-                        nums = []
-                        for c in cells[1:]:  # skip label column
-                            c = c.replace(",", "").strip()
-                            if c in ("", "-", "NA"):
-                                nums.append(0.0)
-                            else:
-                                try:
-                                    nums.append(float(c))
-                                except:
-                                    nums.append(0.0)
-
-                        # Correct structure of row:
-                        # [Tax Payable, Adjustment, Net, IGST ITC, CGST ITC, SGST ITC, Cess, Cash...]
-
-                        if len(nums) >= 6:
-                            paid_igst = nums[3]
-                            paid_cgst = nums[4]
-                            paid_sgst = nums[5]
-
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            
+        # Fix split numbers before searching
+        text = fix_broken_numbers(text)
+        
+        # Locate the 6.1 Payment Table
+        m_61 = re.search(r"6\.1\s*Payment", text, re.IGNORECASE)
+        if m_61:
+            chunk = text[m_61.start(): m_61.start() + 2000]
+            
+            # This regex looks for the Tax Name, followed by all the numbers/dashes in that row
+            row_pattern = r"(Integrated|Central|State/UT|State)\s*Tax\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
+            
+            for match in re.finditer(row_pattern, chunk, re.IGNORECASE):
+                nums_text = match.group(2)
+                
+                tokens = []
+                for t in nums_text.split():
+                    t_clean = t.replace(",", "").strip()
+                    # Convert PDF dashes and blanks directly to 0.0
+                    if t_clean in ("-", "NA", "0", "0.0"):
+                        tokens.append(0.0)
+                    elif re.match(r"^-?\d+\.\d{2}$", t_clean):
+                        tokens.append(float(t_clean))
+                
+                # GSTR-3B Column Structure:
+                # [0] Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
+                if len(tokens) >= 4:
+                    paid_igst += tokens[1]
+                    paid_cgst += tokens[2]
+                    paid_sgst += tokens[3]
+                    
     except Exception:
         pass
 
@@ -214,7 +212,6 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    # Call the newly extracted function
     paid_igst, paid_cgst, paid_sgst = extract_6_1A(file)
 
     return {
