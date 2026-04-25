@@ -1,229 +1,380 @@
-import streamlit as st
-import pandas as pd
-import pdfplumber
+"""
+GST Bulk Extractor  ·  GSTR-1 + GSTR-3B
+─────────────────────────────────────────
+Multi-user ready: each Streamlit browser session is completely isolated.
+
+Output: single Excel file with 4 sheets
+  Sheet 1  GSTR-1       Sales, Exports, CDN, Amendments, Tax Liability
+  Sheet 2  3.1(d) RCM   Taxable Value + IGST / CGST / SGST
+  Sheet 3  4(C) ITC     Net ITC: IGST / CGST / SGST
+  Sheet 4  6.1(A)       Tax paid via ITC: IGST / CGST / SGST
+"""
+
+import io
 import re
 
-st.set_page_config(page_title="Bulk GSTR-1 Extractor", page_icon="📑", layout="wide")
+import pandas as pd
+import pdfplumber
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-st.title("📑 Bulk GSTR-1 PDF Extractor")
-st.write("Upload multiple GSTR-1 PDFs. Extracts Sales (B2B+B2CS), Exports (6A+6B+6C), Credit/Debit Notes, Amendments, and Tax Liability.")
+# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="GST Bulk Extractor", page_icon="🧾", layout="wide")
+st.title("🧾 GST Bulk Extractor — GSTR-1 + GSTR-3B")
+st.caption(
+    "Upload multiple PDFs for each return type. "
+    "Multiple team members can use this at the same time — every session is independent."
+)
+
+# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+MONTHS = [
+    "January","February","March","April","May","June",
+    "July","August","September","October","November","December",
+]
+MONTH_FY_ORDER = {m: (i - 3) % 12 for i, m in enumerate(MONTHS)}
+
+# ── SHARED HELPERS ────────────────────────────────────────────────────────────
+
+def pdf_to_text(file) -> str:
+    with pdfplumber.open(file) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CORE HELPER: extract the first amount after the word "total" inside a section
-# ──────────────────────────────────────────────────────────────────────────────
-def get_section_total(text, header_pattern, stop_pattern=None, target_word="total", window=1500):
-    """
-    Finds header_pattern in text, slices a window up to stop_pattern,
-    then returns the first ₹ amount after target_word.
-    """
-    start_match = re.search(header_pattern, text, re.IGNORECASE | re.DOTALL)
-    if not start_match:
+def find_amounts(text: str, n: int = 1) -> list:
+    vals = re.findall(r"-?[\d,]+\.\d{2}", text)
+    result = []
+    for v in vals:
+        result.append(float(v.replace(",", "")))
+        if len(result) == n:
+            break
+    return result
+
+
+def section_total(text, header_re, stop_re=None, target_word="total", window=1500) -> float:
+    m = re.search(header_re, text, re.IGNORECASE | re.DOTALL)
+    if not m:
         return 0.0
-
-    start = start_match.start()
+    start = m.start()
     end = start + window
-
-    if stop_pattern:
-        stop_match = re.search(stop_pattern, text[start + 10:], re.IGNORECASE)
-        if stop_match:
-            end = start + 10 + stop_match.start()
-
-    section = text[start:end]
-
-    target_match = re.search(target_word, section, re.IGNORECASE)
-    if not target_match:
+    if stop_re:
+        s = re.search(stop_re, text[start + 10:], re.IGNORECASE)
+        if s:
+            end = start + 10 + s.start()
+    chunk = text[start:end]
+    tm = re.search(target_word, chunk, re.IGNORECASE)
+    if not tm:
         return 0.0
-
-    amounts = re.findall(r'-?[\d,]+\.\d{2}', section[target_match.start():])
-    if amounts:
-        return float(amounts[0].replace(',', ''))
-    return 0.0
+    vals = find_amounts(chunk[tm.start():], 1)
+    return vals[0] if vals else 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MONTH EXTRACTOR
-# ──────────────────────────────────────────────────────────────────────────────
-MONTHS = ["January","February","March","April","May","June",
-          "July","August","September","October","November","December"]
-
-def extract_month(text):
-    match = re.search(r'Tax\s+[Pp]eriod\s+([A-Za-z]+)', text)
-    if match:
-        return match.group(1).capitalize()
-    # fallback: scan for any month name near the top of the doc
-    for m in MONTHS:
-        if re.search(m, text[:500], re.IGNORECASE):
-            return m
+def extract_month(text: str) -> str:
+    m = re.search(r"(?:Tax\s+[Pp]eriod|Period)\s+([A-Za-z]+)", text)
+    if m:
+        return m.group(1).capitalize()
+    for mo in MONTHS:
+        if re.search(mo, text[:600], re.IGNORECASE):
+            return mo
     return "Unknown"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# TOTAL LIABILITY (IGST / CGST / SGST) — reads the summary line at doc end
-# ──────────────────────────────────────────────────────────────────────────────
-def extract_liability(text):
-    """
-    Looks for: Total Liability ... 39,51,023.20  1,97,551.16  0.00  0.00  0.00
-    Columns:  Value | IGST | CGST | SGST | Cess
-    """
+def sort_by_month(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["_s"] = df["Month"].map(lambda x: MONTH_FY_ORDER.get(x, 99))
+    return df.sort_values("_s").drop(columns=["_s"]).reset_index(drop=True)
+
+
+def row_amounts(text: str, row_re: str, stop_re: str, count: int = 5) -> list:
+    m = re.search(row_re, text, re.IGNORECASE)
+    if not m:
+        return [0.0] * count
+    start = m.start()
+    stop_m = re.search(stop_re, text[start + 5:], re.IGNORECASE)
+    end = start + 5 + (stop_m.start() if stop_m else 500)
+    vals = find_amounts(text[start:end], count)
+    while len(vals) < count:
+        vals.append(0.0)
+    return vals
+
+
+# ── GSTR-1 PARSER ─────────────────────────────────────────────────────────────
+
+def parse_gstr1(file) -> dict:
+    text = pdf_to_text(file)
+    month = extract_month(text)
+
+    b2b = section_total(text,
+        r"4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered",
+        r"4B\s*[-–]?\s*Taxable")
+    b2cs = section_total(text,
+        r"7\s*[-–]?\s*Taxable\s+supplies.*?unregistered",
+        r"8\s*[-–]?\s*Nil")
+
+    exp_6a  = section_total(text, r"6A\s*[–-]?\s*Exports?\s*\(",   r"6B\s*[-–]?\s*Supplies")
+    sez_6b  = section_total(text, r"6B\s*[-–]?\s*Supplies.*?SEZ",  r"6C\s*[-–]?\s*Deemed")
+    dee_6c  = section_total(text, r"6C\s*[-–]?\s*Deemed\s+Exports", r"7\s*[-–]?\s*Taxable")
+
+    cdn_reg   = section_total(text,
+        r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)",
+        r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)",
+        target_word=r"Total\s*[-–]?\s*Net\s+off")
+    cdn_unreg = section_total(text,
+        r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)",
+        r"9C\s*[-–]?\s*Amended",
+        target_word=r"Total\s*[-–]?\s*Net\s+off")
+
+    amendment_9a = 0.0
+    s9a = re.search(r"9A\s*[-–]?\s*Amendment", text, re.IGNORECASE)
+    s9b = re.search(r"9B\s*[-–]?\s*Credit",    text, re.IGNORECASE)
+    if s9a:
+        boundary = s9b.start() if s9b else len(text)
+        for nd in re.finditer(
+            r"Net\s+differential\s+amount.*?([\d,]+\.\d{2})",
+            text[s9a.start(): boundary], re.IGNORECASE
+        ):
+            amendment_9a += float(nd.group(1).replace(",", ""))
+
     igst = cgst = sgst = 0.0
-    match = re.search(
-        r'Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})',
-        text, re.IGNORECASE
-    )
-    if match:
-        # groups: value, igst, cgst, sgst
-        igst = float(match.group(2).replace(',', ''))
-        cgst = float(match.group(3).replace(',', ''))
-        sgst = float(match.group(4).replace(',', ''))
+    m = re.search(
+        r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
+        text, re.IGNORECASE)
+    if m:
+        igst, cgst, sgst = float(m.group(2).replace(",","")), float(m.group(3).replace(",","")), float(m.group(4).replace(",",""))
     else:
-        # fallback: find "Total Liability" and grab next 4 amounts
-        m2 = re.search(r'Total\s+Liability', text, re.IGNORECASE)
+        m2 = re.search(r"Total\s+Liability", text, re.IGNORECASE)
         if m2:
-            chunk = text[m2.start(): m2.start() + 400]
-            amounts = re.findall(r'-?[\d,]+\.\d{2}', chunk)
-            if len(amounts) >= 4:
-                igst = float(amounts[1].replace(',', ''))
-                cgst = float(amounts[2].replace(',', ''))
-                sgst = float(amounts[3].replace(',', ''))
-    return igst, cgst, sgst
+            v = find_amounts(text[m2.start(): m2.start()+400], 4)
+            if len(v) >= 4:
+                igst, cgst, sgst = v[1], v[2], v[3]
+
+    return {
+        "Month":              month,
+        "File":               file.name,
+        "Sales B2B (4A)":     b2b,
+        "Sales B2CS (7)":     b2cs,
+        "Total Sales":        b2b + b2cs,
+        "6A Exports":         exp_6a,
+        "6B SEZ":             sez_6b,
+        "6C Deemed Export":   dee_6c,
+        "Total Exports":      exp_6a + sez_6b + dee_6c,
+        "Credit/Debit Notes": cdn_reg + cdn_unreg,
+        "Amendment 9A":       amendment_9a,
+        "IGST Liability":     igst,
+        "CGST Liability":     cgst,
+        "SGST Liability":     sgst,
+    }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FILE UPLOADER
-# ──────────────────────────────────────────────────────────────────────────────
-uploaded_files = st.file_uploader(
-    "Drop all your GSTR-1 PDFs here",
-    type="pdf",
-    accept_multiple_files=True
-)
+# ── GSTR-3B PARSER ────────────────────────────────────────────────────────────
 
-if uploaded_files:
-    if st.button("⚡ Extract Data from All Files"):
-        all_data = []
+def parse_gstr3b(file) -> dict:
+    text = pdf_to_text(file)
+    month = extract_month(text)
 
-        with st.spinner("Processing your files…"):
-            for file in uploaded_files:
-                try:
-                    with pdfplumber.open(file) as pdf:
-                        full_text = "\n".join(
-                            page.extract_text() or "" for page in pdf.pages
-                        )
+    # 3.1(d) — RCM: taxable, igst, cgst, sgst, cess
+    rcm = row_amounts(text,
+        r"\(d\)\s+Inward supplies\s*\(liable to reverse charge\)",
+        r"\(e\)\s+Non.GST", count=5)
 
-                    # ── 1. MONTH ──────────────────────────────────────────────
-                    month_name = extract_month(full_text)
+    # 4(C) — Net ITC Available: igst, cgst, sgst, cess
+    itc = row_amounts(text,
+        r"C\.\s+Net ITC available\s*\(A[-–]?B\)",
+        r"\(D\)\s+Other Details", count=4)
 
-                    # ── 2. SALES = B2B (4A) + B2CS (7) ──────────────────────
-                    b2b = get_section_total(
-                        full_text,
-                        r'4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered',
-                        r'4B\s*[-–]?\s*Taxable'
-                    )
-                    b2cs = get_section_total(
-                        full_text,
-                        r'7\s*[-–]?\s*Taxable\s+supplies.*?unregistered',
-                        r'8\s*[-–]?\s*Nil'
-                    )
-                    total_sales = b2b + b2cs
+    # 6.1(A) — Tax paid via ITC
+    # Row structure per tax type: payable | adj | net_payable | ITC_used | cash | ...
+    # We need position [3] = ITC used for each row (IGST, CGST, SGST)
+    paid_igst = paid_cgst = paid_sgst = 0.0
 
-                    # ── 3. EXPORTS = 6A + 6B + 6C ────────────────────────────
-                    exp_6a = get_section_total(
-                        full_text,
-                        r'6A\s*[–-]?\s*Exports?\s*\(',
-                        r'6B\s*[-–]?\s*Supplies'
-                    )
-                    sez_6b = get_section_total(
-                        full_text,
-                        r'6B\s*[-–]?\s*Supplies\s+made\s+to\s+SEZ',
-                        r'6C\s*[-–]?\s*Deemed'
-                    )
-                    deemed_6c = get_section_total(
-                        full_text,
-                        r'6C\s*[-–]?\s*Deemed\s+Exports',
-                        r'7\s*[-–]?\s*Taxable'
-                    )
-                    total_exports = exp_6a + sez_6b + deemed_6c
+    sec_a = re.search(r"\(A\)\s+Other\s+than\s+reverse\s+charge", text, re.IGNORECASE)
+    sec_b = re.search(r"\(B\)\s+Reverse\s+charge",                text, re.IGNORECASE)
 
-                    # ── 4. CREDIT / DEBIT NOTES = 9B Reg + 9B Unreg ─────────
-                    cdn_reg = get_section_total(
-                        full_text,
-                        r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)',
-                        r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)',
-                        target_word=r'Total\s*[-–]?\s*Net\s+off'
-                    )
-                    cdn_unreg = get_section_total(
-                        full_text,
-                        r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)',
-                        r'9C\s*[-–]?\s*Amended',
-                        target_word=r'Total\s*[-–]?\s*Net\s+off'
-                    )
-                    total_cdn = cdn_reg + cdn_unreg
+    if sec_a:
+        a_start = sec_a.start()
+        a_end   = sec_b.start() if sec_b else a_start + 900
+        chunk   = text[a_start:a_end]
 
-                    # ── 5. AMENDMENT (9A) — net differential ─────────────────
-                    # 9A has multiple sub-sections; we sum all "Net differential" lines
-                    amendment_9a = 0.0
-                    for nd_match in re.finditer(
-                        r'Net\s+differential\s+amount.*?([\d,]+\.\d{2})',
-                        full_text, re.IGNORECASE
-                    ):
-                        # only inside 9A section (before 9B)
-                        pos = nd_match.start()
-                        sec_9a = re.search(r'9A\s*[-–]?\s*Amendment', full_text, re.IGNORECASE)
-                        sec_9b = re.search(r'9B\s*[-–]?\s*Credit', full_text, re.IGNORECASE)
-                        if sec_9a and (not sec_9b or pos < sec_9b.start()) and pos > sec_9a.start():
-                            val = float(nd_match.group(1).replace(',', ''))
-                            amendment_9a += val
+        def itc_from_row(row_pattern):
+            rm = re.search(row_pattern, chunk, re.IGNORECASE)
+            if not rm:
+                return 0.0
+            # grab 4 numbers after the row label; position [3] is ITC used
+            v = find_amounts(chunk[rm.start(): rm.start() + 400], 4)
+            return v[3] if len(v) >= 4 else 0.0
 
-                    # ── 6. TAX LIABILITY ──────────────────────────────────────
-                    igst, cgst, sgst = extract_liability(full_text)
+        paid_igst = itc_from_row(r"Integrated\s*\n?\s*tax")
+        paid_cgst = itc_from_row(r"Central\s*\n?\s*tax")
+        paid_sgst = itc_from_row(r"State/UT\s*\n?\s*tax")
 
-                    all_data.append({
-                        "Month":              month_name,
-                        "File Name":          file.name,
-                        "Sales (B2B)":        b2b,
-                        "Sales (B2CS)":       b2cs,
-                        "Total Sales":        total_sales,
-                        "6A - Exports":       exp_6a,
-                        "6B - SEZ":           sez_6b,
-                        "6C - Deemed Export": deemed_6c,
-                        "Total Exports":      total_exports,
-                        "Credit/Debit Notes": total_cdn,
-                        "Amendment (9A)":     amendment_9a,
-                        "IGST":               igst,
-                        "CGST":               cgst,
-                        "SGST":               sgst,
-                    })
+    return {
+        "Month":          month,
+        "File":           file.name,
+        # 3.1(d)
+        "RCM Taxable":    rcm[0],
+        "RCM IGST":       rcm[1],
+        "RCM CGST":       rcm[2],
+        "RCM SGST":       rcm[3],
+        # 4(C)
+        "ITC IGST":       itc[0],
+        "ITC CGST":       itc[1],
+        "ITC SGST":       itc[2],
+        # 6.1(A)
+        "Paid ITC IGST":  paid_igst,
+        "Paid ITC CGST":  paid_cgst,
+        "Paid ITC SGST":  paid_sgst,
+    }
 
-                except Exception as e:
-                    st.error(f"❌ Could not process **{file.name}**. Error: {e}")
 
-        # ── OUTPUT ────────────────────────────────────────────────────────────
-        if all_data:
-            df = pd.DataFrame(all_data)
+# ── EXCEL BUILDER ─────────────────────────────────────────────────────────────
+HDR_FILL = PatternFill("solid", fgColor="1F4E79")
+HDR_FONT = Font(bold=True, color="FFFFFF", size=10)
+TTL_FONT = Font(bold=True, color="1F4E79", size=12)
+RUPEE    = '#,##0.00'
 
-            # Sort April → March (financial year order)
-            month_order = {m: (i - 3) % 12 for i, m in enumerate(MONTHS)}
-            df["_sort"] = df["Month"].map(lambda x: month_order.get(x, 99))
-            df = df.sort_values("_sort").drop(columns=["_sort"])
 
-            st.success(f"✅ Processed {len(all_data)} file(s) successfully!")
+def write_table(ws, title: str, df: pd.DataFrame, start_row: int) -> int:
+    ws.cell(start_row, 1, title).font = TTL_FONT
+    start_row += 1
+    for ci, col in enumerate(df.columns, 1):
+        c = ws.cell(start_row, ci, col)
+        c.fill, c.font = HDR_FILL, HDR_FONT
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+    start_row += 1
+    for _, row in df.iterrows():
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(start_row, ci, val)
+            if isinstance(val, float):
+                c.number_format = RUPEE
+                c.alignment = Alignment(horizontal="right")
+            else:
+                c.alignment = Alignment(horizontal="left")
+        start_row += 1
+    return start_row + 1
 
-            # Styled display
-            currency_cols = [
-                "Sales (B2B)", "Sales (B2CS)", "Total Sales",
-                "6A - Exports", "6B - SEZ", "6C - Deemed Export", "Total Exports",
-                "Credit/Debit Notes", "Amendment (9A)",
-                "IGST", "CGST", "SGST"
-            ]
-            st.dataframe(
-                df.style.format({c: "₹{:,.2f}" for c in currency_cols}),
-                use_container_width=True
-            )
 
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Download as CSV",
-                data=csv,
-                file_name="GSTR1_Bulk_Extraction.csv",
-                mime="text/csv",
-            )
+def build_excel(gstr1_rows: list, gstr3b_rows: list) -> bytes:
+    wb = Workbook()
+
+    # Sheet 1 — GSTR-1
+    ws1 = wb.active
+    ws1.title = "GSTR-1"
+    if gstr1_rows:
+        df1 = sort_by_month(pd.DataFrame(gstr1_rows))
+        write_table(ws1, "GSTR-1 Summary (Month-wise)", df1, 1)
+        for i, col in enumerate(df1.columns, 1):
+            ws1.column_dimensions[get_column_letter(i)].width = max(18, len(str(col)) + 2)
+
+    # Sheets 2-4 — GSTR-3B
+    ws2 = wb.create_sheet("3.1(d) RCM")
+    ws3 = wb.create_sheet("4(C) Net ITC")
+    ws4 = wb.create_sheet("6.1(A) Tax via ITC")
+
+    if gstr3b_rows:
+        df3 = sort_by_month(pd.DataFrame(gstr3b_rows))
+        write_table(ws2, "3.1(d) – Inward Supplies Liable to RCM",
+                    df3[["Month","File","RCM Taxable","RCM IGST","RCM CGST","RCM SGST"]], 1)
+        write_table(ws3, "4(C) – Net ITC Available (A – B)",
+                    df3[["Month","File","ITC IGST","ITC CGST","ITC SGST"]], 1)
+        write_table(ws4, "6.1(A) – Tax Paid through ITC",
+                    df3[["Month","File","Paid ITC IGST","Paid ITC CGST","Paid ITC SGST"]], 1)
+        for ws in (ws2, ws3, ws4):
+            for i in range(1, 8):
+                ws.column_dimensions[get_column_letter(i)].width = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+col_l, col_r = st.columns(2)
+
+with col_l:
+    st.subheader("📄 GSTR-1 PDFs")
+    gstr1_files = st.file_uploader(
+        "Multiple months supported",
+        type="pdf", accept_multiple_files=True, key="up1")
+
+with col_r:
+    st.subheader("📋 GSTR-3B PDFs")
+    gstr3b_files = st.file_uploader(
+        "Multiple months supported",
+        type="pdf", accept_multiple_files=True, key="up2")
+
+st.divider()
+
+if st.button("⚡ Extract & Download Excel", type="primary",
+             disabled=(not gstr1_files and not gstr3b_files)):
+
+    gstr1_rows, gstr3b_rows, errors = [], [], []
+
+    with st.spinner("Processing PDFs…"):
+        for f in (gstr1_files or []):
+            try:
+                gstr1_rows.append(parse_gstr1(f))
+            except Exception as e:
+                errors.append(f"GSTR-1 | {f.name}: {e}")
+        for f in (gstr3b_files or []):
+            try:
+                gstr3b_rows.append(parse_gstr3b(f))
+            except Exception as e:
+                errors.append(f"GSTR-3B | {f.name}: {e}")
+
+    for err in errors:
+        st.error(f"❌ {err}")
+
+    # Preview
+    if gstr1_rows:
+        st.markdown("### GSTR-1 Summary")
+        df1 = sort_by_month(pd.DataFrame(gstr1_rows))
+        num_cols = [c for c in df1.columns if c not in ("Month","File")]
+        st.dataframe(df1.style.format({c: "₹{:,.2f}" for c in num_cols}),
+                     use_container_width=True)
+
+    if gstr3b_rows:
+        df3 = sort_by_month(pd.DataFrame(gstr3b_rows))
+        num3 = [c for c in df3.columns if c not in ("Month","File")]
+
+        st.markdown("### 3.1(d) — RCM")
+        rcm_df = df3[["Month","File","RCM Taxable","RCM IGST","RCM CGST","RCM SGST"]]
+        st.dataframe(rcm_df.style.format({c: "₹{:,.2f}" for c in rcm_df.columns if c not in ("Month","File")}),
+                     use_container_width=True)
+
+        st.markdown("### 4(C) — Net ITC Available")
+        itc_df = df3[["Month","File","ITC IGST","ITC CGST","ITC SGST"]]
+        st.dataframe(itc_df.style.format({c: "₹{:,.2f}" for c in itc_df.columns if c not in ("Month","File")}),
+                     use_container_width=True)
+
+        st.markdown("### 6.1(A) — Tax Paid via ITC")
+        paid_df = df3[["Month","File","Paid ITC IGST","Paid ITC CGST","Paid ITC SGST"]]
+        st.dataframe(paid_df.style.format({c: "₹{:,.2f}" for c in paid_df.columns if c not in ("Month","File")}),
+                     use_container_width=True)
+
+    # Download
+    if gstr1_rows or gstr3b_rows:
+        excel_bytes = build_excel(gstr1_rows, gstr3b_rows)
+        st.success(
+            f"✅ {len(gstr1_rows)} GSTR-1 and {len(gstr3b_rows)} GSTR-3B file(s) processed.")
+        st.download_button(
+            label="📥 Download Combined Excel (4 sheets)",
+            data=excel_bytes,
+            file_name="GST_Bulk_Extract.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+with st.expander("ℹ️ What's extracted & multi-user info"):
+    st.markdown("""
+| Sheet | Table | Fields |
+|---|---|---|
+| **GSTR-1** | 4A, 7, 6A/B/C, 9A, 9B | Sales B2B+B2CS, Exports, CDN, Amendments, IGST/CGST/SGST |
+| **3.1(d) RCM** | GSTR-3B 3.1(d) | Taxable Value + IGST + CGST + SGST |
+| **4(C) ITC** | GSTR-3B 4(C) | Net ITC: IGST + CGST + SGST |
+| **6.1(A) ITC** | GSTR-3B 6.1(A) | Tax paid via ITC: IGST + CGST + SGST |
+
+**Multi-user:** Streamlit creates an isolated session per browser tab.  
+Multiple team members can extract data simultaneously without any conflict.  
+Deploy on **Streamlit Community Cloud** (free) for a shared link — just push to GitHub.
+    """)
+        
