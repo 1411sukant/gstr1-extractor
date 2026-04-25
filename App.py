@@ -8,33 +8,39 @@ st.set_page_config(page_title="Bulk GSTR-1 Extractor", page_icon="📑", layout=
 st.title("📑 Bulk GSTR-1 PDF Extractor")
 st.write("Upload multiple GSTR-1 PDFs. Extracts Month, Sales, Exports (6A, 6B, 6C), Credit Notes, Taxes, and 9A Amendments.")
 
-# --- THE BULLETPROOF BLOCK EXTRACTION SYSTEM ---
-def get_value_for_section(text, header, stop_header=None, target_word="total"):
-    """Finds a section of the PDF, isolates it, and grabs the required number."""
-    start = text.lower().find(header.lower())
-    if start == -1:
+# --- THE BULLETPROOF REGEX SYSTEM ---
+def get_value_for_section(text, header_pattern, stop_pattern=None, target_word="total"):
+    """Uses pattern matching to ignore weird PDF spaces, line breaks, and dashes."""
+    # Find the start of the section using Regex
+    start_match = re.search(header_pattern, text, re.IGNORECASE)
+    if not start_match:
         return 0.0
-    
-    end = len(text)
-    if stop_header:
-        stop_idx = text.lower().find(stop_header.lower(), start + len(header))
-        if stop_idx != -1:
-            end = stop_idx
-    else:
-        end = start + 1500 # Fallback safety buffer
         
-    # Isolate the exact block of text for this specific table
+    start = start_match.start()
+    
+    # Find the end of the section using Regex
+    end = len(text)
+    if stop_pattern:
+        stop_match = re.search(stop_pattern, text[start:], re.IGNORECASE)
+        if stop_match:
+            end = start + stop_match.start()
+        else:
+            end = start + 1500
+    else:
+        end = start + 1500
+        
     section = text[start:end]
     
-    # Find the target word (usually 'Total' or 'Net differential')
-    target_idx = section.lower().find(target_word.lower())
-    if target_idx == -1:
+    # Find the exact target word ("total", "net differential", etc.)
+    target_match = re.search(target_word, section, re.IGNORECASE)
+    if not target_match:
         return 0.0
         
-    # Find all decimal numbers AFTER the target word
+    target_idx = target_match.start()
+    
+    # Find all decimal numbers AFTER the target word (catches negatives too!)
     amounts = re.findall(r'-?[\d,]+\.\d{2}', section[target_idx:])
     if amounts:
-        # Return the very first decimal number found
         return float(amounts[0].replace(',', ''))
     return 0.0
 
@@ -49,40 +55,40 @@ if uploaded_files:
         with st.spinner('Processing your files...'):
             for file in uploaded_files:
                 try:
-                    # Read the entire PDF into one giant string
                     with pdfplumber.open(file) as pdf:
                         full_text = ""
                         for page in pdf.pages:
-                            full_text += page.extract_text() + "\n"
+                            # Add a space between pages to prevent words from merging
+                            full_text += page.extract_text() + " \n "
                     
                     # 1. Extract Month
                     month_name = "Unknown"
-                    tax_period_idx = full_text.lower().find("tax period")
-                    if tax_period_idx != -1:
-                        chunk = full_text[tax_period_idx:tax_period_idx+200]
+                    tax_period_match = re.search(r'tax period', full_text, re.IGNORECASE)
+                    if tax_period_match:
+                        chunk = full_text[tax_period_match.start():tax_period_match.start()+200]
                         for m in months_list:
                             if m.lower() in chunk.lower():
                                 month_name = m
                                 break
                     
-                    # 2. Extract Business Data using the Block Search
-                    taxable_sale = get_value_for_section(full_text, "4A-Taxable outward", "4B-Taxable")
+                    # 2. Extract Business Data (Using highly flexible Regex patterns)
+                    taxable_sale = get_value_for_section(full_text, r'4A\s*[-–]\s*Taxable', r'4B\s*[-–]\s*Taxable')
                     
-                    export_6a = get_value_for_section(full_text, "6A-Exports", "6B-Supplies")
-                    sez_6b = get_value_for_section(full_text, "6B-Supplies made to SEZ", "6C-Deemed")
-                    deemed_6c = get_value_for_section(full_text, "6C-Deemed Exports", "7- Taxable")
+                    export_6a = get_value_for_section(full_text, r'6A\s*[-–]\s*Export', r'6B\s*[-–]\s*Supplies')
+                    sez_6b = get_value_for_section(full_text, r'6B\s*[-–]\s*Supplies', r'6C\s*[-–]\s*Deemed')
+                    deemed_6c = get_value_for_section(full_text, r'6C\s*[-–]\s*Deemed', r'7\s*[-–]\s*Taxable')
                     
-                    # Credit Notes (We check both registered and unregistered and combine them)
-                    cdnr = get_value_for_section(full_text, "9B-Credit/Debit Notes", "9C-Amended", "total")
+                    # Credit Notes
+                    cdnr = get_value_for_section(full_text, r'9B\s*[-–]\s*Credit', r'9C\s*[-–]\s*Amended', target_word="total")
                     
-                    # 9A Amendments (Targeting the 'Net differential' word instead of Total)
-                    amendment_9a = get_value_for_section(full_text, "9A-Amendment", "9B-Credit", "net differential")
+                    # 9A Amendments
+                    amendment_9a = get_value_for_section(full_text, r'9A\s*[-–]\s*Amendment', r'9B\s*[-–]\s*Credit', target_word="net differential")
                     
-                    # 3. Extract Total Liability (IGST, CGST, SGST)
+                    # 3. Extract Total Liability
                     igst, cgst, sgst = 0.0, 0.0, 0.0
-                    liab_idx = full_text.lower().find("total liability")
-                    if liab_idx != -1:
-                        chunk = full_text[liab_idx:liab_idx+500]
+                    liab_match = re.search(r'Total Liability', full_text, re.IGNORECASE)
+                    if liab_match:
+                        chunk = full_text[liab_match.start():liab_match.start()+500]
                         amounts = re.findall(r'-?[\d,]+\.\d{2}', chunk)
                         if len(amounts) >= 4:
                             igst = float(amounts[1].replace(',', ''))
@@ -111,8 +117,7 @@ if uploaded_files:
             if all_data:
                 df = pd.DataFrame(all_data)
                 
-                # Sort chronologically (April to March for Financial Year)
-                # Shifting index so April = 0, March = 11
+                # Sort chronologically (April to March)
                 month_dict = {m: (i-3)%12 for i, m in enumerate(months_list)}
                 df['Month_Sort'] = df['Month'].map(lambda x: month_dict.get(x, 99))
                 df = df.sort_values('Month_Sort').drop('Month_Sort', axis=1)
