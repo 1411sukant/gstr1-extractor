@@ -24,7 +24,6 @@ st.set_page_config(page_title="GST Bulk Extractor", page_icon="🧾", layout="wi
 st.title("🧾 GST Bulk Extractor — GSTR-1 + GSTR-3B")
 st.caption(
     "Upload multiple PDFs for each return type. "
-    "Multiple team members can use this at the same time — every session is independent."
 )
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -114,10 +113,14 @@ def parse_gstr1(file) -> dict:
     cdn_reg   = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
     cdn_unreg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", r"9C\s*[-–]?\s*Amended", target_word=r"Total\s*[-–]?\s*Net\s+off")
 
-    # [FIXED 9A]: Scans the entire document to capture ALL "Net differential" amounts (B2B, B2C, SEZ, Export)
+    # ── [FIXED] 9A AMENDMENTS (SUMS ALL INSTANCES) ──────────────────────────
     amendment_9a = 0.0
-    for nd in re.finditer(r"Net\s+differential\s+amount.*?(-?[\d,]+\.\d{2})", text, re.IGNORECASE | re.DOTALL):
-        amendment_9a += float(nd.group(1).replace(",", ""))
+    for m9a in re.finditer(r"9A\s*[-–]?\s*Amendment", text, re.IGNORECASE):
+        # Look ahead from this exact 9A header to find its specific Net differential
+        chunk = text[m9a.end(): m9a.end() + 600]
+        nd_match = re.search(r"Net\s+differential.*?(-?[\d,]+\.\d{2})", chunk, re.IGNORECASE | re.DOTALL)
+        if nd_match:
+            amendment_9a += float(nd_match.group(1).replace(",", ""))
 
     igst = cgst = sgst = 0.0
     m = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
@@ -158,37 +161,40 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    # ── [FIXED] 6.1(A) — Tax paid via ITC (COLUMN-WISE TOTAL) ────────────────────────
+    # ── [FIXED] 6.1(A) — Tax paid via ITC (DASH-SAFE & COLUMN-WISE SUM) ────
     paid_igst = paid_cgst = paid_sgst = 0.0
     
-    m_61 = re.search(r"6\.1\s*Payment\s*of\s*tax", text, re.IGNORECASE)
+    m_61 = re.search(r"6\.1\s*Payment", text, re.IGNORECASE)
     if m_61:
         end_61 = text.find("6.2", m_61.start())
         if end_61 == -1: end_61 = text.find("Verification", m_61.start())
         if end_61 == -1: end_61 = len(text)
-        
         chunk_61 = text[m_61.start():end_61]
         
-        # Look for rows starting with the liability name, followed by their numbers and dashes
-        for row_match in re.finditer(r"(integrated tax|central tax|state/ut tax)\s+([0-9,\.\-\s]+)", chunk_61, re.IGNORECASE):
-            nums_text = row_match.group(2).strip()
-            tokens = nums_text.split()
+        # This regex looks for the row name, then aggressively grabs ALL numbers/dashes that follow it
+        row_pattern = r"(Integrated\s*Tax|Central\s*Tax|State/UT\s*Tax|State\s*Tax)\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
+        
+        for match in re.finditer(row_pattern, chunk_61, re.IGNORECASE):
+            head = match.group(1).lower()
+            nums_text = match.group(2)
             
-            row_vals = []
-            for t in tokens:
-                t = t.replace(",", "")
-                # Convert PDF dashes directly into 0.0 to prevent columns from sliding left
-                if t == "-" or t.lower() == "na":
-                    row_vals.append(0.0)
-                elif re.match(r"^-?\d+\.\d{2}$", t):
-                    row_vals.append(float(t))
+            # Translate dashes and NAs properly so columns never slide left
+            tokens = []
+            for t in nums_text.split():
+                t_clean = t.replace(",", "").strip()
+                if t_clean in ("-", "NA", "0", "0.0"):
+                    tokens.append(0.0)
+                elif re.match(r"^-?\d+\.\d{2}$", t_clean):
+                    tokens.append(float(t_clean))
             
-            # GSTR-3B 6.1 standard columns: [0] Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
-            # The += mathematically adds the column vertically for every single row
-            if len(row_vals) >= 4:
-                paid_igst += row_vals[1]
-                paid_cgst += row_vals[2]
-                paid_sgst += row_vals[3]
+            # GSTR-3B 6.1 Standard Layout:
+            # [0] Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
+            # Using += adds up the columns vertically across every row
+            if len(tokens) >= 4:
+                if "integrated" in head or "central" in head or "state" in head:
+                    paid_igst += tokens[1]
+                    paid_cgst += tokens[2]
+                    paid_sgst += tokens[3]
 
     return {
         "Month":          month,
