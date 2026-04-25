@@ -116,78 +116,71 @@ def extract_9A_amendment(text: str) -> float:
 
 def extract_6_1A(file):
     net_payable = paid_igst = paid_cgst = paid_sgst = 0.0
-    table_found = False
 
     try:
         with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-
-                for tbl in tables:
-                    is_6_1 = False
-                    net_col_idx = -1
-                    
-                    # 1. Look at the headers to find the EXACT column for Net Tax Payable
-                    for row in tbl[:5]:
-                        if not row: continue
-                        row_txt = " ".join([str(x).lower().replace('\n', ' ') for x in row if x])
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            
+        text = fix_broken_numbers(text)
+        
+        # 1. STRICT FIREWALL: Isolate ONLY the 6.1 section to skip Table 3.1
+        m_61 = re.search(r"6\s*\.\s*1\s*Payment", text, re.IGNORECASE)
+        if m_61:
+            end_idx = text.find("6.2", m_61.end())
+            if end_idx == -1: end_idx = text.find("Verification", m_61.end())
+            if end_idx == -1: end_idx = m_61.end() + 3000
+            
+            chunk = text[m_61.end():end_idx]
+            
+            # 2. Text-Scanning Regex
+            # Grabs the Row Label, followed by a continuous string of numbers and dashes
+            row_pattern = r"(Integrated|Central|State/UT|State)\s*[Tt]ax\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
+            
+            # Prevent double-counting if the PDF repeats a row
+            found_igst = found_cgst = found_sgst = False
+            
+            for match in re.finditer(row_pattern, chunk, re.IGNORECASE):
+                tax_head = match.group(1).lower()
+                nums_text = match.group(2)
+                
+                # Clean and convert the extracted cells
+                tokens = []
+                for t in nums_text.split():
+                    t_clean = t.replace(",", "").strip()
+                    if t_clean in ("-", "NA", "0", "0.0", "0.00"):
+                        tokens.append(0.0)
+                    elif re.match(r"^-?\d+\.\d{2}$", t_clean):
+                        tokens.append(float(t_clean))
                         
-                        if "paid through itc" in row_txt or "payment of tax" in row_txt:
-                            is_6_1 = True
-                            
-                        for c_idx, cell in enumerate(row):
-                            if cell and "net tax payable" in str(cell).lower().replace('\n', ' '):
-                                net_col_idx = c_idx
-                    
-                    # Ignore Table 3.1 or any other tables
-                    if not is_6_1:
-                        continue
+                # 3. APPLY YOUR EXACT HUMAN BLUEPRINT
+                # Tokens Array:
+                # [0] Tax Payable
+                # [1] Adjustment
+                # [2] Net Tax Payable (Your 4th Column)
+                # [3] ITC IGST (Your 5th Column, Sub 1)
+                # [4] ITC CGST (Your 5th Column, Sub 2)
+                # [5] ITC SGST (Your 5th Column, Sub 3)
+                
+                if len(tokens) >= 6:
+                    if "integrated" in tax_head and not found_igst:
+                        net_payable += tokens[2]
+                        paid_igst += tokens[3]
+                        paid_cgst += tokens[4]
+                        paid_sgst += tokens[5]
+                        found_igst = True
+                    elif "central" in tax_head and not found_cgst:
+                        net_payable += tokens[2]
+                        paid_igst += tokens[3]
+                        paid_cgst += tokens[4]
+                        paid_sgst += tokens[5]
+                        found_cgst = True
+                    elif ("state" in tax_head or "ut" in tax_head) and not found_sgst:
+                        net_payable += tokens[2]
+                        paid_igst += tokens[3]
+                        paid_cgst += tokens[4]
+                        paid_sgst += tokens[5]
+                        found_sgst = True
                         
-                    table_found = True
-                        
-                    # HUMAN BLUEPRINT FALLBACK: As you explained, if header parsing fails, it's the 4th column (Index 3)
-                    if net_col_idx == -1:
-                        net_col_idx = 3
-                        
-                    # 2. Extract Data from specific columns
-                    for row in tbl:
-                        if not row: continue
-                        
-                        # Combine first two cells to catch the description (in case there's an S.No column)
-                        desc = str(row[0]).lower().replace('\n', ' ')
-                        if len(row) > 1:
-                            desc += " " + str(row[1]).lower().replace('\n', ' ')
-                            
-                        is_igst = "integrated" in desc and "tax" in desc
-                        is_cgst = "central" in desc and "tax" in desc and "integrated" not in desc
-                        is_sgst = ("state" in desc or "ut" in desc) and "tax" in desc
-                        
-                        if not (is_igst or is_cgst or is_sgst):
-                            continue
-                            
-                        # Safety check: Ensure row has enough columns
-                        if len(row) <= net_col_idx + 3:
-                            continue
-                            
-                        def parse_val(val):
-                            if not val: return 0.0
-                            # Fix broken numbers inside cells (e.g. 602750.0 \n 0 -> 602750.00)
-                            v = str(val).replace(",", "").replace("\n", "").replace(" ", "").strip()
-                            if v in ("-", "NA", "", "0", "0.0", "0.00"): return 0.0
-                            try: return float(v)
-                            except ValueError: return 0.0
-                            
-                        # Grabs exactly the 4th, 5th, 6th, and 7th columns as you detailed!
-                        val_net  = parse_val(row[net_col_idx])
-                        val_igst = parse_val(row[net_col_idx + 1])
-                        val_cgst = parse_val(row[net_col_idx + 2])
-                        val_sgst = parse_val(row[net_col_idx + 3])
-                        
-                        net_payable += val_net
-                        paid_igst += val_igst
-                        paid_cgst += val_cgst
-                        paid_sgst += val_sgst
-
     except Exception:
         pass
 
