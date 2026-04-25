@@ -24,6 +24,7 @@ st.set_page_config(page_title="GST Bulk Extractor", page_icon="🧾", layout="wi
 st.title("🧾 GST Bulk Extractor — GSTR-1 + GSTR-3B")
 st.caption(
     "Upload multiple PDFs for each return type. "
+    "Multiple team members can use this at the same time — every session is independent."
 )
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -98,9 +99,67 @@ def row_amounts(text: str, row_re: str, stop_re: str, count: int = 5) -> list:
         vals.append(0.0)
     return vals
 
+# ── CUSTOM 9A & 6.1(A) HELPERS ────────────────────────────────────────────────
+def extract_9A_amendment(text: str) -> float:
+    total = 0.0
+    sections = re.split(r"\n\s*9A\s*[-–]", text, flags=re.IGNORECASE)
+    
+    for sec in sections[1:]:
+        m = re.search(
+            r"Net\s+differential\s+amount.*?(-?[\d,]+\.\d{2})",
+            sec, re.IGNORECASE | re.DOTALL
+        )
+        if m:
+            total += float(m.group(1).replace(",", ""))
+            
+    return total
+
+def extract_6_1A(file):
+    paid_igst = paid_cgst = paid_sgst = 0.0
+
+    try:
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+
+                for tbl in tables:
+                    for row in tbl:
+                        if not row:
+                            continue
+
+                        cells = [str(c).strip() if c else "" for c in row]
+                        row_text = " ".join(cells).lower()
+
+                        if "integrated tax" not in row_text:
+                            continue
+
+                        nums = []
+                        for c in cells[1:]:
+                            c = c.replace(",", "").strip()
+                            if c in ("", "-", "NA"):
+                                nums.append(0.0)
+                            else:
+                                try:
+                                    nums.append(float(c))
+                                except:
+                                    nums.append(0.0)
+
+                        # CORRECT COLUMN STRUCTURE:
+                        # [Tax Payable, Adjustment, Net, IGST ITC, CGST ITC, SGST ITC, ...]
+                        if len(nums) >= 6:
+                            paid_igst = nums[3]
+                            paid_cgst = nums[4]
+                            paid_sgst = nums[5]
+
+    except Exception:
+        pass
+
+    return paid_igst, paid_cgst, paid_sgst
+
 # ── GSTR-1 PARSER ─────────────────────────────────────────────────────────────
 def parse_gstr1(file) -> dict:
-    text = pdf_to_text(file)
+    # [CHANGE 1 APPLIED]: Fix broken numbers on GSTR-1 text extraction
+    text = fix_broken_numbers(pdf_to_text(file))
     month = extract_month(text)
 
     b2b = section_total(text, r"4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered", r"4B\s*[-–]?\s*Taxable")
@@ -113,14 +172,8 @@ def parse_gstr1(file) -> dict:
     cdn_reg   = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
     cdn_unreg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", r"9C\s*[-–]?\s*Amended", target_word=r"Total\s*[-–]?\s*Net\s+off")
 
-    # ── [FIXED] 9A AMENDMENTS (SUMS ALL INSTANCES) ──────────────────────────
-    amendment_9a = 0.0
-    for m9a in re.finditer(r"9A\s*[-–]?\s*Amendment", text, re.IGNORECASE):
-        # Look ahead from this exact 9A header to find its specific Net differential
-        chunk = text[m9a.end(): m9a.end() + 600]
-        nd_match = re.search(r"Net\s+differential.*?(-?[\d,]+\.\d{2})", chunk, re.IGNORECASE | re.DOTALL)
-        if nd_match:
-            amendment_9a += float(nd_match.group(1).replace(",", ""))
+    # [CHANGE 2 APPLIED]: Replaced old 9A logic with extract_9A_amendment function
+    amendment_9a = extract_9A_amendment(text)
 
     igst = cgst = sgst = 0.0
     m = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
@@ -161,40 +214,8 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    # ── [FIXED] 6.1(A) — Tax paid via ITC (DASH-SAFE & COLUMN-WISE SUM) ────
-    paid_igst = paid_cgst = paid_sgst = 0.0
-    
-    m_61 = re.search(r"6\.1\s*Payment", text, re.IGNORECASE)
-    if m_61:
-        end_61 = text.find("6.2", m_61.start())
-        if end_61 == -1: end_61 = text.find("Verification", m_61.start())
-        if end_61 == -1: end_61 = len(text)
-        chunk_61 = text[m_61.start():end_61]
-        
-        # This regex looks for the row name, then aggressively grabs ALL numbers/dashes that follow it
-        row_pattern = r"(Integrated\s*Tax|Central\s*Tax|State/UT\s*Tax|State\s*Tax)\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
-        
-        for match in re.finditer(row_pattern, chunk_61, re.IGNORECASE):
-            head = match.group(1).lower()
-            nums_text = match.group(2)
-            
-            # Translate dashes and NAs properly so columns never slide left
-            tokens = []
-            for t in nums_text.split():
-                t_clean = t.replace(",", "").strip()
-                if t_clean in ("-", "NA", "0", "0.0"):
-                    tokens.append(0.0)
-                elif re.match(r"^-?\d+\.\d{2}$", t_clean):
-                    tokens.append(float(t_clean))
-            
-            # GSTR-3B 6.1 Standard Layout:
-            # [0] Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
-            # Using += adds up the columns vertically across every row
-            if len(tokens) >= 4:
-                if "integrated" in head or "central" in head or "state" in head:
-                    paid_igst += tokens[1]
-                    paid_cgst += tokens[2]
-                    paid_sgst += tokens[3]
+    # [CHANGE 3 APPLIED]: Replace old 6.1(A) logic with the custom function call
+    paid_igst, paid_cgst, paid_sgst = extract_6_1A(file)
 
     return {
         "Month":          month,
