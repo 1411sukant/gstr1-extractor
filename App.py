@@ -116,6 +116,7 @@ def extract_9A_amendment(text: str) -> float:
 
 def extract_6_1A(file):
     net_payable = paid_igst = paid_cgst = paid_sgst = 0.0
+    found_in_table = False
 
     try:
         with pdfplumber.open(file) as pdf:
@@ -123,6 +124,24 @@ def extract_6_1A(file):
                 tables = page.extract_tables()
 
                 for tbl in tables:
+                    is_6_1 = False
+                    
+                    # 1. STRICT FIREWALL: Only process this table if it is actually 6.1
+                    # We check the headers of the table for "tax paid through itc" or "net tax payable"
+                    for row in tbl[:4]:
+                        if not row: continue
+                        row_txt = " ".join([str(x).lower() for x in row if x])
+                        if "paid through itc" in row_txt or "net tax payable" in row_txt:
+                            is_6_1 = True
+                            break
+                    
+                    # If it's Table 3.1 or something else, skip it entirely!
+                    if not is_6_1:
+                        continue
+                        
+                    found_in_table = True
+                    
+                    # 2. Extract Data from 6.1
                     for row in tbl:
                         if not row:
                             continue
@@ -130,7 +149,6 @@ def extract_6_1A(file):
                         cells = [str(c).strip() if c else "" for c in row]
                         row_text = " ".join(cells).lower()
 
-                        # Scan all liability rows (Integrated, Central, State)
                         is_igst = "integrated" in row_text and "tax" in row_text
                         is_cgst = "central" in row_text and "tax" in row_text and "integrated" not in row_text
                         is_sgst = ("state" in row_text or "ut" in row_text) and "tax" in row_text
@@ -149,13 +167,40 @@ def extract_6_1A(file):
                                 except:
                                     nums.append(0.0)
 
-                        # EXACT COLUMN MATCH BASED ON YOUR IMAGE:
+                        # 3. Apply exact columns: 
                         # [0] Net Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
                         if len(nums) >= 4:
                             net_payable += nums[0]
                             paid_igst += nums[1]
                             paid_cgst += nums[2]
                             paid_sgst += nums[3]
+
+            # 4. Bulletproof Fallback (If the PDF is corrupted and extract_tables fails)
+            if not found_in_table:
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                text = fix_broken_numbers(text)
+                
+                m_61 = re.search(r"6\.1\s*Payment", text, re.IGNORECASE)
+                if m_61:
+                    end_61 = text.find("6.2", m_61.start())
+                    if end_61 == -1: end_61 = text.find("Verification", m_61.start())
+                    if end_61 == -1: end_61 = m_61.start() + 2000
+                    chunk = text[m_61.start():end_61]
+                    
+                    row_pattern = r"(Integrated|Central|State/UT|State)\s*Tax\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
+                    for match in re.finditer(row_pattern, chunk, re.IGNORECASE):
+                        nums_text = match.group(2)
+                        tokens = []
+                        for t in nums_text.split():
+                            t_clean = t.replace(",", "").strip()
+                            if t_clean in ("-", "NA", "0", "0.0"): tokens.append(0.0)
+                            elif re.match(r"^-?\d+\.\d{2}$", t_clean): tokens.append(float(t_clean))
+                        
+                        if len(tokens) >= 4:
+                            net_payable += tokens[0]
+                            paid_igst += tokens[1]
+                            paid_cgst += tokens[2]
+                            paid_sgst += tokens[3]
 
     except Exception:
         pass
