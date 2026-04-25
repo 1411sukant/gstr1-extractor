@@ -119,84 +119,61 @@ def extract_6_1A(file):
 
     try:
         with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-
-                for tbl in tables:
-                    is_table_6_1 = False
-                    
-                    # --- IRON-CLAD FIREWALL ---
-                    # We look at the top rows of the table. By removing hidden \n line breaks, 
-                    # we guarantee it correctly identifies "net tax payable" and ignores Table 3.1
-                    for row in tbl[:5]:  
-                        if not row: continue
-                        row_txt = " ".join([str(x).lower().replace('\n', ' ') for x in row if x])
-                        
-                        if "paid through itc" in row_txt or "net tax payable" in row_txt or "payment of tax" in row_txt:
-                            is_table_6_1 = True
-                            break
-                            
-                    # If this isn't Table 6.1, completely skip it!
-                    if not is_table_6_1:
-                        continue  
-
-                    # --- EXTRACT THE 6.1 DATA ---
-                    for row in tbl:
-                        if not row: continue
-
-                        cells = [str(c).lower().replace('\n', ' ').strip() if c else "" for c in row]
-                        row_text = " ".join(cells)
-
-                        is_igst = "integrated" in row_text and "tax" in row_text
-                        is_cgst = "central" in row_text and "tax" in row_text and "integrated" not in row_text
-                        is_sgst = ("state" in row_text or "ut" in row_text) and "tax" in row_text
-                        
-                        if not (is_igst or is_cgst or is_sgst):
-                            continue
-
-                        nums = []
-                        for c in cells[1:]:  # Skip the row name
-                            c_clean = c.replace(",", "").strip()
-                            if c_clean in ("-", "na", "", "0", "0.0"):
-                                nums.append(0.0)
-                            elif re.match(r"^-?\d+\.\d{2}$", c_clean):
-                                nums.append(float(c_clean))
-
-                        # --- EXACT COLUMN MAPPING ---
-                        # [0] Net Tax Payable
-                        # [1] Paid through ITC - Integrated Tax
-                        # [2] Paid through ITC - Central Tax
-                        # [3] Paid through ITC - State/UT Tax
-                        if len(nums) >= 4:
-                            net_payable += nums[0]
-                            paid_igst += nums[1]
-                            paid_cgst += nums[2]
-                            paid_sgst += nums[3]
-
-            # --- TEXT FALLBACK (In case the PDF table is totally invisible) ---
-            if net_payable == 0 and paid_igst == 0 and paid_cgst == 0 and paid_sgst == 0:
-                with pdfplumber.open(file) as pdf_fb:
-                    text = fix_broken_numbers("\n".join(page.extract_text() or "" for page in pdf_fb.pages))
+            # We skip table extraction completely and read it purely as text
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            
+        text = fix_broken_numbers(text)
+        
+        # 1. Isolate the 6.1 Section
+        m_61 = re.search(r"6\s*\.\s*1\s*Payment", text, re.IGNORECASE)
+        if m_61:
+            end_idx = text.find("6.2", m_61.end())
+            if end_idx == -1: end_idx = text.find("Verification", m_61.end())
+            if end_idx == -1: end_idx = m_61.end() + 3000
+            
+            chunk = text[m_61.end():end_idx]
+            
+            # 2. Text-Scanning Regex
+            # This looks for "Integrated Tax", "Central Tax", etc. and then scoops up the next 4+ numbers/dashes
+            row_pattern = r"(Integrated|Central|State/UT|State)\s*[Tt]ax\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
+            
+            # Track which rows we've found to prevent duplicates
+            found_igst = found_cgst = found_sgst = False
+            
+            for match in re.finditer(row_pattern, chunk, re.IGNORECASE):
+                tax_head = match.group(1).lower()
+                nums_text = match.group(2)
                 
-                m_61 = re.search(r"6\.1\s*Payment", text, re.IGNORECASE)
-                if m_61:
-                    chunk = text[m_61.start(): m_61.start() + 2500]
-                    for label in [r"Integrated\s*tax", r"Central\s*tax", r"State(?:/UT)?\s*tax"]:
-                        m_row = re.search(label + r"\s+(.*?)(?:Integrated|Central|State|Cess|Total|$)", chunk, re.IGNORECASE | re.DOTALL)
-                        if m_row:
-                            tokens = re.findall(r"-|[\d,]+\.\d{2}", m_row.group(1))
-                            nums = []
-                            for t in tokens:
-                                t = t.replace(",", "")
-                                if t == "-": nums.append(0.0)
-                                else: nums.append(float(t))
-                            
-                            if len(nums) >= 4:
-                                net_payable += nums[0]
-                                paid_igst += nums[1]
-                                paid_cgst += nums[2]
-                                paid_sgst += nums[3]
-
+                tokens = nums_text.split()
+                nums = []
+                for t in tokens:
+                    t_clean = t.replace(",", "").strip()
+                    if t_clean in ("-", "NA", "0", "0.0"):
+                        nums.append(0.0)
+                    elif re.match(r"^-?\d+\.\d{2}$", t_clean):
+                        nums.append(float(t_clean))
+                        
+                # 3. Process the Extracted Numbers
+                # Layout: [0] Net Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
+                if len(nums) >= 4:
+                    if "integrated" in tax_head and not found_igst:
+                        net_payable += nums[0]
+                        paid_igst += nums[1]
+                        paid_cgst += nums[2]
+                        paid_sgst += nums[3]
+                        found_igst = True
+                    elif "central" in tax_head and not found_cgst:
+                        net_payable += nums[0]
+                        paid_igst += nums[1]
+                        paid_cgst += nums[2]
+                        paid_sgst += nums[3]
+                        found_cgst = True
+                    elif ("state" in tax_head or "ut" in tax_head) and not found_sgst:
+                        net_payable += nums[0]
+                        paid_igst += nums[1]
+                        paid_cgst += nums[2]
+                        paid_sgst += nums[3]
+                        found_sgst = True
     except Exception:
         pass
 
