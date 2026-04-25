@@ -10,15 +10,13 @@ st.write("Upload multiple GSTR-1 PDFs. Extracts Month, Sales, Exports (6A, 6B, 6
 
 # --- THE BULLETPROOF REGEX SYSTEM ---
 def get_value_for_section(text, header_pattern, stop_pattern=None, target_word="total"):
-    """Uses pattern matching to ignore weird PDF spaces, line breaks, and dashes."""
-    # Find the start of the section using Regex
+    """Uses pattern matching to ignore weird PDF spaces, missing dashes, and line breaks."""
     start_match = re.search(header_pattern, text, re.IGNORECASE)
     if not start_match:
         return 0.0
         
     start = start_match.start()
     
-    # Find the end of the section using Regex
     end = len(text)
     if stop_pattern:
         stop_match = re.search(stop_pattern, text[start:], re.IGNORECASE)
@@ -31,14 +29,12 @@ def get_value_for_section(text, header_pattern, stop_pattern=None, target_word="
         
     section = text[start:end]
     
-    # Find the exact target word ("total", "net differential", etc.)
     target_match = re.search(target_word, section, re.IGNORECASE)
     if not target_match:
         return 0.0
         
     target_idx = target_match.start()
     
-    # Find all decimal numbers AFTER the target word (catches negatives too!)
     amounts = re.findall(r'-?[\d,]+\.\d{2}', section[target_idx:])
     if amounts:
         return float(amounts[0].replace(',', ''))
@@ -58,7 +54,6 @@ if uploaded_files:
                     with pdfplumber.open(file) as pdf:
                         full_text = ""
                         for page in pdf.pages:
-                            # Add a space between pages to prevent words from merging
                             full_text += page.extract_text() + " \n "
                     
                     # 1. Extract Month
@@ -71,20 +66,22 @@ if uploaded_files:
                                 month_name = m
                                 break
                     
-                    # 2. Extract Business Data (Using highly flexible Regex patterns)
-                    taxable_sale = get_value_for_section(full_text, r'4A\s*[-–]\s*Taxable', r'4B\s*[-–]\s*Taxable')
+                    # 2. Extract Business Data (The '?' makes the dashes optional so it never misses)
+                    taxable_sale = get_value_for_section(full_text, r'4A\s*[-–]?\s*Taxable', r'4B\s*[-–]?\s*Taxable')
                     
-                    export_6a = get_value_for_section(full_text, r'6A\s*[-–]\s*Export', r'6B\s*[-–]\s*Supplies')
-                    sez_6b = get_value_for_section(full_text, r'6B\s*[-–]\s*Supplies', r'6C\s*[-–]\s*Deemed')
-                    deemed_6c = get_value_for_section(full_text, r'6C\s*[-–]\s*Deemed', r'7\s*[-–]\s*Taxable')
+                    export_6a = get_value_for_section(full_text, r'6A\s*[-–]?\s*Export', r'6B\s*[-–]?\s*Supplies')
+                    sez_6b = get_value_for_section(full_text, r'6B\s*[-–]?\s*Supplies', r'6C\s*[-–]?\s*Deemed')
+                    deemed_6c = get_value_for_section(full_text, r'6C\s*[-–]?\s*Deemed', r'7\s*[-–]?\s*Taxable')
                     
-                    # Credit Notes
-                    cdnr = get_value_for_section(full_text, r'9B\s*[-–]\s*Credit', r'9C\s*[-–]\s*Amended', target_word="total")
+                    # 3. Credit Notes (Safely hunts for both Registered and Unregistered and adds them together)
+                    cdnr_reg = get_value_for_section(full_text, r'9B\s*[-–]?\s*Credit.*Registered', r'9B\s*[-–]?\s*Credit.*Unregistered|9C\s*[-–]?\s*Amended', target_word="total")
+                    cdnr_unreg = get_value_for_section(full_text, r'9B\s*[-–]?\s*Credit.*Unregistered', r'9C\s*[-–]?\s*Amended', target_word="total")
+                    cdnr_total = cdnr_reg + cdnr_unreg
                     
-                    # 9A Amendments
-                    amendment_9a = get_value_for_section(full_text, r'9A\s*[-–]\s*Amendment', r'9B\s*[-–]\s*Credit', target_word="net differential")
+                    # 4. 9A Amendments
+                    amendment_9a = get_value_for_section(full_text, r'9A\s*[-–]?\s*Amendment', r'9B\s*[-–]?\s*Credit', target_word="net differential")
                     
-                    # 3. Extract Total Liability
+                    # 5. Extract Total Liability
                     igst, cgst, sgst = 0.0, 0.0, 0.0
                     liab_match = re.search(r'Total Liability', full_text, re.IGNORECASE)
                     if liab_match:
@@ -95,7 +92,7 @@ if uploaded_files:
                             cgst = float(amounts[2].replace(',', ''))
                             sgst = float(amounts[3].replace(',', ''))
 
-                    # 4. Save to Master List
+                    # 6. Save to Master List
                     all_data.append({
                         "Month": month_name,
                         "File Name": file.name,
@@ -103,7 +100,7 @@ if uploaded_files:
                         "6A - Exports": export_6a,
                         "6B - SEZ Supplies": sez_6b,
                         "6C - Deemed Exports": deemed_6c,
-                        "Credit/Debit Notes": cdnr,
+                        "Credit/Debit Notes": cdnr_total,
                         "Total IGST": igst,
                         "Total CGST": cgst,
                         "Total SGST": sgst,
@@ -113,7 +110,7 @@ if uploaded_files:
                 except Exception as e:
                     st.error(f"Could not process {file.name}. Error: {e}")
             
-            # 5. Output Data
+            # 7. Output Data
             if all_data:
                 df = pd.DataFrame(all_data)
                 
