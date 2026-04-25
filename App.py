@@ -114,22 +114,13 @@ def parse_gstr1(file) -> dict:
     cdn_reg   = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
     cdn_unreg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", r"9C\s*[-–]?\s*Amended", target_word=r"Total\s*[-–]?\s*Net\s+off")
 
+    # [FIXED 9A]: Scans the entire document to capture ALL "Net differential" amounts (B2B, B2C, SEZ, Export)
     amendment_9a = 0.0
-    s9a = re.search(r"9A\s*[-–]?\s*Amendment", text, re.IGNORECASE)
-    s9b = re.search(r"9B\s*[-–]?\s*Credit",    text, re.IGNORECASE)
-    if s9a:
-        boundary = s9b.start() if s9b else len(text)
-        # ADDED re.DOTALL and `-?` to perfectly capture multi-line and negative Net Differentials!
-        for nd in re.finditer(
-            r"Net\s+differential\s+amount.*?(-?[\d,]+\.\d{2})",
-            text[s9a.start(): boundary], re.IGNORECASE | re.DOTALL
-        ):
-            amendment_9a += float(nd.group(1).replace(",", ""))
+    for nd in re.finditer(r"Net\s+differential\s+amount.*?(-?[\d,]+\.\d{2})", text, re.IGNORECASE | re.DOTALL):
+        amendment_9a += float(nd.group(1).replace(",", ""))
 
     igst = cgst = sgst = 0.0
-    m = re.search(
-        r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
-        text, re.IGNORECASE)
+    m = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
     if m:
         igst, cgst, sgst = float(m.group(2).replace(",","")), float(m.group(3).replace(",","")), float(m.group(4).replace(",",""))
     else:
@@ -167,71 +158,37 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    # ── 6.1(A) — Tax paid via ITC (COLUMN-WISE TOTAL) ────────────────────────
+    # ── [FIXED] 6.1(A) — Tax paid via ITC (COLUMN-WISE TOTAL) ────────────────────────
     paid_igst = paid_cgst = paid_sgst = 0.0
-    table_extracted = False
-
-    try:
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                for tbl in tables:
-                    for row in tbl:
-                        if row is None:
-                            continue
-                        cells = [str(c).strip() if c else "" for c in row]
-                        row_text = " ".join(cells).lower()
-
-                        # Check if this row is a tax payment row
-                        is_igst = "integrated" in row_text and "tax" in row_text
-                        is_cgst = "central" in row_text and "tax" in row_text and "integrated" not in row_text
-                        is_sgst = ("state" in row_text or "ut" in row_text) and "tax" in row_text
-                        
-                        if not (is_igst or is_cgst or is_sgst):
-                            continue
-                            
-                        table_extracted = True
-                        
-                        # Collect cells correctly (preserving exact columns even if dashed!)
-                        nums = []
-                        for c in cells[1:]: # Skip the text description column
-                            c_clean = c.replace(",", "").strip()
-                            # If cell is a dash or blank, force it to 0.0 to keep columns aligned!
-                            if c_clean in ("-", "", "NA"):
-                                nums.append(0.0)
-                            else:
-                                try:
-                                    nums.append(float(c_clean))
-                                except ValueError:
-                                    nums.append(0.0)
-
-                        # Row Layout: [0]Payable, [1]IGST ITC, [2]CGST ITC, [3]SGST ITC
-                        # We use += to SUM ALL ROWS column-wise!
-                        if len(nums) >= 4:
-                            paid_igst += nums[1]
-                            paid_cgst += nums[2]
-                            paid_sgst += nums[3]
-    except Exception:
-        pass
-
-    # Fallback only if the table didn't scan properly
-    if not table_extracted:
-        sec_a = re.search(r"\(A\)\s+Other\s+than\s+reverse\s+charge", text, re.IGNORECASE)
-        sec_b = re.search(r"\(B\)\s+Reverse\s+charge",                text, re.IGNORECASE)
-        if sec_a:
-            a_start = sec_a.start()
-            a_end   = sec_b.start() if sec_b else a_start + 1200
-            chunk   = text[a_start:a_end]
-
-            def itc_from_row(row_re):
-                rm = re.search(row_re, chunk, re.IGNORECASE | re.DOTALL)
-                if not rm: return 0.0
-                v = find_amounts(chunk[rm.start(): rm.start() + 600], 6)
-                return v[3] if len(v) >= 4 else 0.0
-
-            paid_igst += itc_from_row(r"Integrated\s+tax")
-            paid_cgst += itc_from_row(r"Central\s+tax")
-            paid_sgst += itc_from_row(r"State/UT\s+tax")
+    
+    m_61 = re.search(r"6\.1\s*Payment\s*of\s*tax", text, re.IGNORECASE)
+    if m_61:
+        end_61 = text.find("6.2", m_61.start())
+        if end_61 == -1: end_61 = text.find("Verification", m_61.start())
+        if end_61 == -1: end_61 = len(text)
+        
+        chunk_61 = text[m_61.start():end_61]
+        
+        # Look for rows starting with the liability name, followed by their numbers and dashes
+        for row_match in re.finditer(r"(integrated tax|central tax|state/ut tax)\s+([0-9,\.\-\s]+)", chunk_61, re.IGNORECASE):
+            nums_text = row_match.group(2).strip()
+            tokens = nums_text.split()
+            
+            row_vals = []
+            for t in tokens:
+                t = t.replace(",", "")
+                # Convert PDF dashes directly into 0.0 to prevent columns from sliding left
+                if t == "-" or t.lower() == "na":
+                    row_vals.append(0.0)
+                elif re.match(r"^-?\d+\.\d{2}$", t):
+                    row_vals.append(float(t))
+            
+            # GSTR-3B 6.1 standard columns: [0] Tax Payable | [1] IGST ITC | [2] CGST ITC | [3] SGST ITC
+            # The += mathematically adds the column vertically for every single row
+            if len(row_vals) >= 4:
+                paid_igst += row_vals[1]
+                paid_cgst += row_vals[2]
+                paid_sgst += row_vals[3]
 
     return {
         "Month":          month,
@@ -377,5 +334,3 @@ if st.button("⚡ Extract & Download Excel", type="primary",
             file_name="GST_Bulk_Extract.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-
-        
