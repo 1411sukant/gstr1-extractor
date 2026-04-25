@@ -241,10 +241,11 @@ def parse_gstr3b(file) -> dict:
     # CRITICAL: dashes "-" occupy a real cell, so we must use column INDEX,
     # not count-of-numeric-values, to find the right amount.
 
-    paid_igst        = 0.0
-    paid_cgst        = 0.0
-    paid_sgst        = 0.0
+    # 6.1(A) all rows × all ITC columns
     net_payable_igst = 0.0
+    igst_r_itc_igst = igst_r_itc_cgst = igst_r_itc_sgst = igst_r_itc_cess = 0.0
+    cgst_r_itc_igst = cgst_r_itc_cgst = cgst_r_itc_sgst = cgst_r_itc_cess = 0.0
+    sgst_r_itc_igst = sgst_r_itc_cgst = sgst_r_itc_sgst = sgst_r_itc_cess = 0.0
 
     def safe_float(val):
         if not val:
@@ -336,60 +337,76 @@ def parse_gstr3b(file) -> dict:
             if not (is_igst or is_cgst or is_sgst):
                 continue
 
-            # Read col 4 → 5 → 6 downward (IGST row → CGST row → SGST row)
+            # Read all 4 ITC columns (4,5,6,7) for each row downward
+            def gc(idx):
+                return safe_float(cells_raw[idx]) if len(cells_raw) > idx else 0.0
+
             if is_igst:
-                net_payable_igst = safe_float(cells_raw[net_col])      if len(cells_raw) > net_col      else 0.0
-                paid_igst        = safe_float(cells_raw[itc_igst_col]) if len(cells_raw) > itc_igst_col else 0.0
+                net_payable_igst = gc(net_col)
+                igst_r_itc_igst  = gc(itc_igst_col)
+                igst_r_itc_cgst  = gc(itc_cgst_col)
+                igst_r_itc_sgst  = gc(itc_sgst_col)
+                igst_r_itc_cess  = gc(itc_sgst_col + 1)
                 found_via_table  = True
             elif is_cgst:
-                paid_cgst       = safe_float(cells_raw[itc_cgst_col]) if len(cells_raw) > itc_cgst_col else 0.0
-                found_via_table = True
+                cgst_r_itc_igst  = gc(itc_igst_col)
+                cgst_r_itc_cgst  = gc(itc_cgst_col)
+                cgst_r_itc_sgst  = gc(itc_sgst_col)
+                cgst_r_itc_cess  = gc(itc_sgst_col + 1)
+                found_via_table  = True
             elif is_sgst:
-                paid_sgst       = safe_float(cells_raw[itc_sgst_col]) if len(cells_raw) > itc_sgst_col else 0.0
-                found_via_table = True
+                sgst_r_itc_igst  = gc(itc_igst_col)
+                sgst_r_itc_cgst  = gc(itc_cgst_col)
+                sgst_r_itc_sgst  = gc(itc_sgst_col)
+                sgst_r_itc_cess  = gc(itc_sgst_col + 1)
+                found_via_table  = True
 
         if found_via_table:
             break
 
-    # ── Method 2: text-based fallback (if table method returned all zeros) ───
-    if not found_via_table or (paid_igst == 0.0 and paid_cgst == 0.0 and paid_sgst == 0.0):
+    # ── Method 2: text-based fallback ────────────────────────────────────────
+    # Uses cleaned text bounded strictly between (A) and (B) headers.
+    # Column positions after row label (dashes skipped by find_amounts):
+    #   IGST row: payable[0] adj[1] net[2] ITC-IGST[3] ITC-CGST[4] ITC-SGST[5] cash[6]
+    #   CGST row: payable[0] adj[1] net[2] ITC-IGST[3] ITC-CGST[4] cash[5]
+    #   SGST row: payable[0] adj[1] net[2] ITC-IGST[3] ITC-SGST[4] cash[5]
+    if not found_via_table:
         sec_a = re.search(r"\(A\)\s*Other\s+than\s+reverse\s+charge", text, re.IGNORECASE)
-        sec_b = re.search(r"\(B\)\s*Reverse\s+charge",                 text, re.IGNORECASE)
-
+        sec_b = re.search(r"\(B\)\s*Reverse\s+charge",                  text, re.IGNORECASE)
         if sec_a:
             a_start = sec_a.start()
             a_end   = sec_b.start() if sec_b else a_start + 2000
             chunk   = text[a_start:a_end]
 
-            # After fix_broken_numbers the rows look like:
-            # "Integrated tax 197551.00 0.00 197551.00 8910.00 188641.00 0.00 0.00 0.00"
-            # Positions (0-indexed from row label):
-            #   0=payable 1=adj 2=net 3=ITC-IGST 4=ITC-CGST 5=ITC-SGST 6=cash ...
-            # Dashes are skipped by find_amounts but:
-            #   - IGST row has no dashes before ITC-IGST → v[3]=ITC-IGST
-            #   - CGST row: ITC-IGST=0 (still a number) → v[3]=0, v[4]=ITC-CGST
-            #   - SGST row: ITC-IGST=0, ITC-CGST=dash(skipped) → v[3]=0, v[4]=ITC-SGST
+            def row_itc(row_re, start_from=0):
+                """Return up to 8 amounts starting from row_re match."""
+                m = re.search(row_re, chunk[start_from:], re.IGNORECASE)
+                if not m:
+                    return [], start_from
+                abs_s = start_from + m.start()
+                return find_amounts(chunk[abs_s: abs_s + 800], 8), start_from + m.end()
 
-            igst_m = re.search(r"Integrated\s+tax", chunk, re.IGNORECASE)
-            if igst_m:
-                v = find_amounts(chunk[igst_m.start(): igst_m.start() + 800], 8)
-                net_payable_igst = v[2] if len(v) > 2 else 0.0
-                paid_igst        = v[3] if len(v) > 3 else 0.0
+            # IGST row — ITC-IGST=v[3], ITC-CGST=v[4], ITC-SGST=v[5]
+            v_igst, pos_after_igst = row_itc(r"Integrated\s+tax")
+            net_payable_igst    = v_igst[2] if len(v_igst) > 2 else 0.0
+            igst_r_itc_igst     = v_igst[3] if len(v_igst) > 3 else 0.0
+            igst_r_itc_cgst     = v_igst[4] if len(v_igst) > 4 else 0.0
+            igst_r_itc_sgst     = v_igst[5] if len(v_igst) > 5 else 0.0
+            igst_r_itc_cess     = v_igst[6] if len(v_igst) > 6 else 0.0
 
-            # For CGST, search ONLY in the portion AFTER the Integrated tax match
-            cgst_search_start = igst_m.end() if igst_m else 0
-            cgst_m = re.search(r"Central\s+tax", chunk[cgst_search_start:], re.IGNORECASE)
-            if cgst_m:
-                abs_start = cgst_search_start + cgst_m.start()
-                v = find_amounts(chunk[abs_start: abs_start + 600], 6)
-                paid_cgst = v[4] if len(v) > 4 else 0.0
+            # CGST row — ITC-CGST=v[4] (ITC-IGST=0 occupies v[3])
+            v_cgst, pos_after_cgst = row_itc(r"Central\s+tax", pos_after_igst)
+            cgst_r_itc_igst     = v_cgst[3] if len(v_cgst) > 3 else 0.0
+            cgst_r_itc_cgst     = v_cgst[4] if len(v_cgst) > 4 else 0.0
+            cgst_r_itc_sgst     = 0.0
+            cgst_r_itc_cess     = 0.0
 
-            sgst_search_start = (cgst_search_start + cgst_m.end()) if cgst_m else cgst_search_start
-            sgst_m = re.search(r"State/UT\s+tax", chunk[sgst_search_start:], re.IGNORECASE)
-            if sgst_m:
-                abs_start = sgst_search_start + sgst_m.start()
-                v = find_amounts(chunk[abs_start: abs_start + 600], 6)
-                paid_sgst = v[4] if len(v) > 4 else 0.0
+            # SGST row — ITC-SGST=v[4] (ITC-IGST=0 at v[3], CGST dash skipped)
+            v_sgst, _ = row_itc(r"State/UT\s+tax", pos_after_cgst)
+            sgst_r_itc_igst     = v_sgst[3] if len(v_sgst) > 3 else 0.0
+            sgst_r_itc_cgst     = 0.0
+            sgst_r_itc_sgst     = v_sgst[4] if len(v_sgst) > 4 else 0.0
+            sgst_r_itc_cess     = 0.0
 
     return {
         "Month":              month,
@@ -403,11 +420,23 @@ def parse_gstr3b(file) -> dict:
         "ITC IGST":           itc[0],
         "ITC CGST":           itc[1],
         "ITC SGST":           itc[2],
-        # 6.1(A)
+        # 6.1(A) — all 4 rows × 4 ITC columns
         "6.1 Net Payable":    net_payable_igst,
-        "6.1A IGST via ITC":  paid_igst,
-        "6.1A CGST via ITC":  paid_cgst,
-        "6.1A SGST via ITC":  paid_sgst,
+        # Integrated tax row
+        "IGST→ITC-IGST":      igst_r_itc_igst,
+        "IGST→ITC-CGST":      igst_r_itc_cgst,
+        "IGST→ITC-SGST":      igst_r_itc_sgst,
+        "IGST→ITC-Cess":      igst_r_itc_cess,
+        # Central tax row
+        "CGST→ITC-IGST":      cgst_r_itc_igst,
+        "CGST→ITC-CGST":      cgst_r_itc_cgst,
+        "CGST→ITC-SGST":      cgst_r_itc_sgst,
+        "CGST→ITC-Cess":      cgst_r_itc_cess,
+        # State/UT tax row
+        "SGST→ITC-IGST":      sgst_r_itc_igst,
+        "SGST→ITC-CGST":      sgst_r_itc_cgst,
+        "SGST→ITC-SGST":      sgst_r_itc_sgst,
+        "SGST→ITC-Cess":      sgst_r_itc_cess,
     }
 
 
@@ -461,8 +490,11 @@ def build_excel(gstr1_rows: list, gstr3b_rows: list) -> bytes:
                     df3[["Month","File","RCM Taxable","RCM IGST","RCM CGST","RCM SGST"]], 1)
         write_table(ws3, "4(C) – Net ITC Available (A – B)",
                     df3[["Month","File","ITC IGST","ITC CGST","ITC SGST"]], 1)
-        write_table(ws4, "6.1(A) – Tax Paid through ITC",
-                    df3[["Month","File","6.1 Net Payable","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]], 1)
+        write_table(ws4, "6.1(A) – Tax Paid through ITC (cols 4-7, rows downward)",
+                    df3[["Month","File","6.1 Net Payable",
+                         "IGST→ITC-IGST","IGST→ITC-CGST","IGST→ITC-SGST","IGST→ITC-Cess",
+                         "CGST→ITC-IGST","CGST→ITC-CGST","CGST→ITC-SGST","CGST→ITC-Cess",
+                         "SGST→ITC-IGST","SGST→ITC-CGST","SGST→ITC-SGST","SGST→ITC-Cess"]], 1)
         for ws in (ws2, ws3, ws4):
             for i in range(1, 8):
                 ws.column_dimensions[get_column_letter(i)].width = 22
@@ -531,8 +563,14 @@ if st.button("⚡ Extract & Download Excel", type="primary",
         st.dataframe(itc_df.style.format({c: "₹{:,.2f}" for c in itc_df.columns if c not in ("Month","File")}),
                      use_container_width=True)
 
-        st.markdown("### 6.1(A) — Tax Paid via ITC")
-        paid_df = df3[["Month","File","6.1 Net Payable","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]]
+        st.markdown("### 6.1(A) — Tax Paid via ITC (cols 4→5→6→7, rows downward)")
+        itc_cols_61 = [
+            "Month","File","6.1 Net Payable",
+            "IGST→ITC-IGST","IGST→ITC-CGST","IGST→ITC-SGST","IGST→ITC-Cess",
+            "CGST→ITC-IGST","CGST→ITC-CGST","CGST→ITC-SGST","CGST→ITC-Cess",
+            "SGST→ITC-IGST","SGST→ITC-CGST","SGST→ITC-SGST","SGST→ITC-Cess",
+        ]
+        paid_df = df3[itc_cols_61]
         st.dataframe(paid_df.style.format({c: "₹{:,.2f}" for c in paid_df.columns if c not in ("Month","File")}),
                      use_container_width=True)
 
@@ -561,5 +599,3 @@ with st.expander("ℹ️ What's extracted & multi-user info"):
 Multiple team members can extract data simultaneously without any conflict.  
 Deploy on **Streamlit Community Cloud** (free) for a shared link — just push to GitHub.
     """)
-
-
