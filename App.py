@@ -345,11 +345,16 @@ def parse_gstr3b(file) -> dict:
         "IGST paid via IGST ITC": igst_itc_igst,   # col 4
         "IGST paid via CGST ITC": igst_itc_cgst,   # col 5 (cross-utilisation)
         "IGST paid via SGST ITC": igst_itc_sgst,   # col 6
-        # 6.1(A) — CGST liability row
+        # 6.1(A) — CGST liability row (Central tax)
         "CGST Net Payable":       cgst_net,
-        "CGST ITC Utilised": cgst_itc,   # col 5: ITC-CGST used to pay CGST
-        "SGST Net Payable":  sgst_net,
-        "SGST ITC Utilised": sgst_itc,   # col 6: ITC-SGST used to pay SGST
+        "CGST paid via IGST ITC": cgst_itc_igst,
+        "CGST paid via CGST ITC": cgst_itc_cgst,
+        "CGST paid via SGST ITC": cgst_itc_sgst,
+        # 6.1(A) — SGST liability row (State/UT tax)
+        "SGST Net Payable":       sgst_net,
+        "SGST paid via IGST ITC": sgst_itc_igst,
+        "SGST paid via CGST ITC": sgst_itc_cgst,
+        "SGST paid via SGST ITC": sgst_itc_sgst,
     }
 
 # ── EXCEL BUILDER ─────────────────────────────────────────────────────────────
