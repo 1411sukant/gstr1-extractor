@@ -151,31 +151,37 @@ def extract_6_1A(file):
                     for c_idx, header_txt in enumerate(col_headers):
                         if "net tax payable" in header_txt:
                             net_col_idx = c_idx
-                    
-                    def choose_tax_col(keywords):
-                        # Prefer columns under "paid through ITC"; otherwise keep first matched tax column.
-                        candidates = []
+
+                    def find_candidates(matchers):
+                        idxs = []
                         for c_idx, header_txt in enumerate(col_headers):
-                            if all(k in header_txt for k in keywords):
-                                candidates.append((c_idx, header_txt))
+                            if all(m in header_txt for m in matchers):
+                                idxs.append(c_idx)
+                        return idxs
+
+                    itc_anchor = next((i for i, h in enumerate(col_headers) if "paid through itc" in h), -1)
+                    cash_anchor = next((i for i, h in enumerate(col_headers) if "paid in cash" in h), -1)
+
+                    def pick_preferred(candidates):
                         if not candidates:
                             return -1
-                        itc_candidates = [c for c in candidates if "itc" in c[1] or "paid through itc" in c[1]]
-                        selected = (itc_candidates[0] if itc_candidates else candidates[0])[0]
-                        return selected
+                        # Prefer columns in the ITC block when both ITC and cash tax columns exist.
+                        if itc_anchor != -1:
+                            if cash_anchor != -1 and cash_anchor > itc_anchor:
+                                scoped = [i for i in candidates if itc_anchor <= i < cash_anchor]
+                            else:
+                                scoped = [i for i in candidates if i >= itc_anchor]
+                            if scoped:
+                                return scoped[0]
+                        return candidates[0]
 
-                    igst_col_idx = choose_tax_col(["integrated", "tax"])
-                    cgst_col_idx = choose_tax_col(["central", "tax"])
-                    sgst_col_idx = choose_tax_col(["tax"])  # refined below to state/ut only
-                    if sgst_col_idx != -1:
-                        if not ("state/ut" in col_headers[sgst_col_idx] or "state tax" in col_headers[sgst_col_idx] or "ut tax" in col_headers[sgst_col_idx]):
-                            sgst_col_idx = -1
+                    igst_col_idx = pick_preferred(find_candidates(["integrated", "tax"]))
+                    cgst_col_idx = pick_preferred(find_candidates(["central", "tax"]))
+                    sgst_col_idx = pick_preferred(find_candidates(["state/ut", "tax"]))
                     if sgst_col_idx == -1:
-                        sgst_col_idx = choose_tax_col(["state/ut", "tax"])
+                        sgst_col_idx = pick_preferred(find_candidates(["state", "tax"]))
                     if sgst_col_idx == -1:
-                        sgst_col_idx = choose_tax_col(["state", "tax"])
-                    if sgst_col_idx == -1:
-                        sgst_col_idx = choose_tax_col(["ut", "tax"])
+                        sgst_col_idx = pick_preferred(find_candidates(["ut", "tax"]))
 
                     # Ignore Table 3.1 or other tables
                     if not is_6_1:
