@@ -396,5 +396,3 @@ if st.button("⚡ Extract & Download Excel", type="primary",
             file_name="GST_Bulk_Extract.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-Latest Code.txt
-Displaying Latest Code.txt.
