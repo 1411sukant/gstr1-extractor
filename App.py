@@ -1,3 +1,45 @@
+
+8 of 29,208
+Macro
+Inbox
+
+Sukant Sharma
+Attachments
+Wed 22 Apr, 18:08 (5 days ago)
+ 
+
+Mail Delivery Subsystem <mailer-daemon@googlemail.com>
+Wed 22 Apr, 18:08 (5 days ago)
+to me
+
+Error Icon
+Address not found
+Your message wasn't delivered to 1411491sukant@gamil.com because the address couldn't be found or is unable to receive email.
+The response from the remote server was:
+511 sorry, no mailbox here by that name (#5.1.1 - chkuser)
+
+
+Sukant Sharma
+Attachments
+Sat 25 Apr, 18:07 (2 days ago)
+On Wed, 22 Apr 2026 at 18:08, Sukant Sharma <1411491sukant@gmail.com> wrote:
+
+Mail Delivery Subsystem
+Sat 25 Apr, 18:07 (2 days ago)
+Address not found Your message wasn't delivered to 1411491sukant@gamil.com because the address couldn't be found or is unable to receive email. The response fro
+
+Sukant Sharma <1411491sukant@gmail.com>
+Attachments
+09:08 (4 hours ago)
+to 1411491sukant
+
+ One attachment
+  •  Scanned by Gmail
+
+Mail Delivery Subsystem <mailer-daemon@googlemail.com>
+09:08 (4 hours ago)
+to me
+
 """
 GST Bulk Extractor  ·  GSTR-1 + GSTR-3B
 ─────────────────────────────────────────
@@ -115,77 +157,159 @@ def extract_9A_amendment(text: str) -> float:
     return total
 
 def extract_6_1A(file):
-    net_payable = paid_igst = paid_cgst = paid_sgst = 0.0
+    """
+    Extract 6.1(A) — Other than reverse charge — data.
+
+    CRITICAL FIX: file.seek(0) is mandatory because parse_gstr3b calls
+    pdf_to_text(file) first which exhausts the file cursor. Without seek(0),
+    pdfplumber reads nothing and all values silently return 0.
+
+    Column layout (standard GSTR-3B table):
+      Col 0: Description
+      Col 1: Tax payable
+      Col 2: Adjustment of negative liability
+      Col 3: Net Tax Payable          ← we want this per row
+      Col 4: ITC – Integrated tax     ← IGST row: ITC-IGST used
+      Col 5: ITC – Central tax        ← CGST row: ITC-CGST used
+      Col 6: ITC – State/UT tax       ← SGST row: ITC-SGST used
+      Col 7: ITC – Cess
+      Col 8: Tax paid in cash
+      ...
+
+    We read DOWNWARD through section (A) rows only:
+      Integrated tax row → net=col3, itc_igst=col4
+      Central tax row    → net=col3, itc_cgst=col5
+      State/UT tax row   → net=col3, itc_sgst=col6
+    """
+
+    # ── Step 1: Reset file cursor (ESSENTIAL) ────────────────────────────────
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    # Each liability row: Net Payable + 3 ITC sub-columns (IGST/CGST/SGST)
+    igst_net=igst_itc_igst=igst_itc_cgst=igst_itc_sgst=0.0
+    cgst_net=cgst_itc_igst=cgst_itc_cgst=cgst_itc_sgst=0.0
+    sgst_net=sgst_itc_igst=sgst_itc_cgst=sgst_itc_sgst=0.0
+
+    def parse_cell(val):
+        """Convert a pdfplumber cell to float. Handles \n splits, dashes, blanks."""
+        if val is None:
+            return 0.0
+        v = str(val).replace(",", "").replace("\n", "").replace(" ", "").strip()
+        if v in ("-", "–", "—", "NA", ""):
+            return 0.0
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
 
     try:
         with pdfplumber.open(file) as pdf:
-            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-            
-        # 1. Fix broken numbers so they aren't split across lines
-        text = fix_broken_numbers(text)
-        
-        # 2. STRICT FIREWALL: Isolate ONLY the 6.1 section to skip Table 3.1
-        m_61 = re.search(r"6\s*\.\s*1\s*Payment", text, re.IGNORECASE)
-        if m_61:
-            end_idx = text.find("6.2", m_61.end())
-            if end_idx == -1: end_idx = text.find("Verification", m_61.end())
-            if end_idx == -1: end_idx = m_61.end() + 3000
-            
-            chunk = text[m_61.end():end_idx]
-            
-            # 3. Text-Scanning Regex
-            # Grabs the Row Label, followed by a continuous string of numbers and dashes
-            row_pattern = r"(Integrated|Central|State/UT|State)\s*[Tt]ax\s+((?:(?:-|\bNA\b|\d[\d,]*\.\d{2})\s*){4,})"
-            
-            # Prevent double-counting if the PDF repeats a row
-            found_igst = found_cgst = found_sgst = False
-            
-            for match in re.finditer(row_pattern, chunk, re.IGNORECASE):
-                tax_head = match.group(1).lower()
-                nums_text = match.group(2)
-                
-                # Clean and convert the extracted cells
-                tokens = []
-                for t in nums_text.split():
-                    t_clean = t.replace(",", "").strip()
-                    if t_clean in ("-", "NA", "0", "0.0", "0.00"):
-                        tokens.append(0.0)
-                    elif re.match(r"^-?\d+\.\d{2}$", t_clean):
-                        tokens.append(float(t_clean))
-                        
-                # 4. APPLY YOUR EXACT HUMAN BLUEPRINT
-                # Tokens Array:
-                # [0] Tax Payable
-                # [1] Adjustment
-                # [2] Net Tax Payable (Your 4th Column)
-                # [3] ITC IGST (Your 5th Column, Sub 1)
-                # [4] ITC CGST (Your 5th Column, Sub 2)
-                # [5] ITC SGST (Your 5th Column, Sub 3)
-                
-                if len(tokens) >= 6:
-                    if "integrated" in tax_head and not found_igst:
-                        net_payable += tokens[2]
-                        paid_igst += tokens[3]
-                        paid_cgst += tokens[4]
-                        paid_sgst += tokens[5]
-                        found_igst = True
-                    elif "central" in tax_head and not found_cgst:
-                        net_payable += tokens[2]
-                        paid_igst += tokens[3]
-                        paid_cgst += tokens[4]
-                        paid_sgst += tokens[5]
-                        found_cgst = True
-                    elif ("state" in tax_head or "ut" in tax_head) and not found_sgst:
-                        net_payable += tokens[2]
-                        paid_igst += tokens[3]
-                        paid_cgst += tokens[4]
-                        paid_sgst += tokens[5]
-                        found_sgst = True
-                        
-    except Exception as e:
+            for page in pdf.pages:
+                for tbl in (page.extract_tables() or []):
+                    if not tbl:
+                        continue
+
+                    # ── Identify if this is the 6.1 Payment of Tax table ──────
+                    flat = " ".join(
+                        str(c).lower().replace("\n", " ")
+                        for row in tbl for c in (row or []) if c
+                    )
+                    if "paid through itc" not in flat and "payment of tax" not in flat:
+                        continue
+
+                    # ── Find column indices from header rows ──────────────────
+                    # Defaults match standard GSTR-3B layout
+                    net_col  = 3
+                    col_igst = 4
+                    col_cgst = 5
+                    col_sgst = 6
+
+                    for row in tbl[:6]:   # scan first 6 rows for headers
+                        if not row:
+                            continue
+                        for ci, cell in enumerate(row):
+                            if not cell:
+                                continue
+                            cell_s = str(cell).lower().replace("\n", " ").strip()
+                            if "net tax" in cell_s and "payable" in cell_s:
+                                net_col = ci
+                            # ITC sub-columns come AFTER net_col
+                            if ci <= net_col:
+                                continue
+                            if "integrated" in cell_s:
+                                col_igst = ci
+                            elif "central" in cell_s:
+                                col_cgst = ci
+                            elif "state" in cell_s or "/ut" in cell_s:
+                                col_sgst = ci
+
+                    # ── Walk rows strictly inside section (A) ─────────────────
+                    in_section_a = False
+                    for row in tbl:
+                        if not row:
+                            continue
+                        row_text = " ".join(
+                            str(c).lower().replace("\n", " ") for c in row if c
+                        )
+
+                        # Enter section (A)
+                        if "other than reverse charge" in row_text:
+                            in_section_a = True
+                            continue
+
+                        # STOP at section (B) — never read its rows
+                        if in_section_a and "reverse charge" in row_text and "other than" not in row_text:
+                            break
+
+                        if not in_section_a:
+                            continue
+
+                        # Scan ALL cells for description (row[0] can be None in merged cells)
+                        desc = " ".join(
+                            str(c).lower().replace("\n", " ")
+                            for c in row if c is not None
+                        )
+
+                        is_igst = "integrated" in desc and "tax" in desc
+                        is_cgst = "central" in desc and "tax" in desc and "integrated" not in desc
+                        is_sgst = ("state" in desc or "state/ut" in desc) and "tax" in desc and "central" not in desc and "integrated" not in desc
+
+                        if not (is_igst or is_cgst or is_sgst):
+                            continue
+
+                        # ── Read net payable (col 3) and correct ITC column ───
+                        def gc(idx):
+                            return parse_cell(row[idx]) if len(row) > idx else 0.0
+
+                        # Every row: read Net Payable + ALL 3 ITC sub-columns
+                        # IGST row: 31,345 via IGST ITC + 5,71,405 via CGST ITC = 6,02,750 ✓
+                        if is_igst:
+                            igst_net      = gc(net_col)   # col 3: Net Tax Payable
+                            igst_itc_igst = gc(col_igst)  # col 4: paid via IGST ITC
+                            igst_itc_cgst = gc(col_cgst)  # col 5: paid via CGST ITC (cross-use)
+                            igst_itc_sgst = gc(col_sgst)  # col 6: paid via SGST ITC
+                        elif is_cgst:
+                            cgst_net      = gc(net_col)
+                            cgst_itc_igst = gc(col_igst)  # col 4
+                            cgst_itc_cgst = gc(col_cgst)  # col 5: paid via CGST ITC
+                            cgst_itc_sgst = gc(col_sgst)  # col 6
+                        elif is_sgst:
+                            sgst_net      = gc(net_col)
+                            sgst_itc_igst = gc(col_igst)  # col 4
+                            sgst_itc_cgst = gc(col_cgst)  # col 5
+                            sgst_itc_sgst = gc(col_sgst)  # col 6: paid via SGST ITC
+
+    except Exception:
         pass
 
-    return net_payable, paid_igst, paid_cgst, paid_sgst
+    return (
+        igst_net, igst_itc_igst, igst_itc_cgst, igst_itc_sgst,
+        cgst_net, cgst_itc_igst, cgst_itc_cgst, cgst_itc_sgst,
+        sgst_net, sgst_itc_igst, sgst_itc_cgst, sgst_itc_sgst,
+    )
 
 # ── GSTR-1 PARSER ─────────────────────────────────────────────────────────────
 def parse_gstr1(file) -> dict:
@@ -243,22 +367,31 @@ def parse_gstr3b(file) -> dict:
     # 4(C)
     itc = row_amounts(text, r"C\.\s+Net ITC available\s*\(A[-–]?B\)", r"\(D\)\s+Other Details", count=4)
 
-    net_payable, paid_igst, paid_cgst, paid_sgst = extract_6_1A(file)
+    (igst_net, igst_itc_igst, igst_itc_cgst, igst_itc_sgst,
+     cgst_net, cgst_itc_igst, cgst_itc_cgst, cgst_itc_sgst,
+     sgst_net, sgst_itc_igst, sgst_itc_cgst, sgst_itc_sgst) = extract_6_1A(file)
 
     return {
-        "Month":          month,
-        "File":           file.name,
-        "RCM Taxable":    rcm[0],
-        "RCM IGST":       rcm[1],
-        "RCM CGST":       rcm[2],
-        "RCM SGST":       rcm[3],
-        "ITC IGST":       itc[0],
-        "ITC CGST":       itc[1],
-        "ITC SGST":       itc[2],
-        "6.1 Net Payable": net_payable,
-        "6.1A IGST via ITC": paid_igst,
-        "6.1A CGST via ITC": paid_cgst,
-        "6.1A SGST via ITC": paid_sgst,
+        "Month":             month,
+        "File":              file.name,
+        "RCM Taxable":       rcm[0],
+        "RCM IGST":          rcm[1],
+        "RCM CGST":          rcm[2],
+        "RCM SGST":          rcm[3],
+        "ITC IGST":          itc[0],
+        "ITC CGST":          itc[1],
+        "ITC SGST":          itc[2],
+        # 6.1(A) — Net Tax Payable + ITC utilised per tax head (diagonal)
+        # 6.1(A) — IGST liability row (Integrated tax)
+        "IGST Net Payable":       igst_net,
+        "IGST paid via IGST ITC": igst_itc_igst,   # col 4
+        "IGST paid via CGST ITC": igst_itc_cgst,   # col 5 (cross-utilisation)
+        "IGST paid via SGST ITC": igst_itc_sgst,   # col 6
+        # 6.1(A) — CGST liability row
+        "CGST Net Payable":       cgst_net,
+        "CGST ITC Utilised": cgst_itc,   # col 5: ITC-CGST used to pay CGST
+        "SGST Net Payable":  sgst_net,
+        "SGST ITC Utilised": sgst_itc,   # col 6: ITC-SGST used to pay SGST
     }
 
 # ── EXCEL BUILDER ─────────────────────────────────────────────────────────────
@@ -309,8 +442,8 @@ def build_excel(gstr1_rows: list, gstr3b_rows: list) -> bytes:
                     df3[["Month","File","RCM Taxable","RCM IGST","RCM CGST","RCM SGST"]], 1)
         write_table(ws3, "4(C) – Net ITC Available (A – B)",
                     df3[["Month","File","ITC IGST","ITC CGST","ITC SGST"]], 1)
-        write_table(ws4, "6.1 – Payment of Tax",
-                    df3[["Month","File","6.1 Net Payable","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]], 1)
+        write_table(ws4, "6.1(A) – Payment of Tax (Other than Reverse Charge)",
+                    df3[["Month","File","IGST Net Payable","IGST paid via IGST ITC","IGST paid via CGST ITC","IGST paid via SGST ITC","CGST Net Payable","CGST paid via IGST ITC","CGST paid via CGST ITC","CGST paid via SGST ITC","SGST Net Payable","SGST paid via IGST ITC","SGST paid via CGST ITC","SGST paid via SGST ITC"]], 1)
         for ws in (ws2, ws3, ws4):
             for i in range(1, 8):
                 ws.column_dimensions[get_column_letter(i)].width = 22
@@ -376,8 +509,8 @@ if st.button("⚡ Extract & Download Excel", type="primary",
         st.dataframe(itc_df.style.format({c: "₹{:,.2f}" for c in itc_df.columns if c not in ("Month","File")}),
                      use_container_width=True)
 
-        st.markdown("### 6.1 — Payment of Tax")
-        paid_df = df3[["Month","File","6.1 Net Payable","6.1A IGST via ITC","6.1A CGST via ITC","6.1A SGST via ITC"]]
+        st.markdown("### 6.1(A) — Payment of Tax (Other than Reverse Charge)")
+        paid_df = df3[["Month","File","IGST Net Payable","IGST paid via IGST ITC","IGST paid via CGST ITC","IGST paid via SGST ITC","CGST Net Payable","CGST paid via IGST ITC","CGST paid via CGST ITC","CGST paid via SGST ITC","SGST Net Payable","SGST paid via IGST ITC","SGST paid via CGST ITC","SGST paid via SGST ITC"]]
         st.dataframe(paid_df.style.format({c: "₹{:,.2f}" for c in paid_df.columns if c not in ("Month","File")}),
                      use_container_width=True)
 
