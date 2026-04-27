@@ -116,7 +116,6 @@ def extract_9A_amendment(text: str) -> float:
 
 def extract_6_1A(file):
     net_payable = paid_igst = paid_cgst = paid_sgst = 0.0
-    table_found = False
 
     try:
         with pdfplumber.open(file) as pdf:
@@ -124,69 +123,139 @@ def extract_6_1A(file):
                 tables = page.extract_tables()
 
                 for tbl in tables:
+                    if not tbl:
+                        continue
+
                     is_6_1 = False
-                    net_col_idx = -1
-                    
-                    # 1. Look at the headers to find the EXACT column for Net Tax Payable
-                    for row in tbl[:5]:
-                        if not row: continue
+                    net_col_idx = igst_col_idx = cgst_col_idx = sgst_col_idx = -1
+
+                    # 1) Detect 6.1 table and robustly map value columns from headers
+                    max_cols = max(len(r) for r in tbl if r) if tbl else 0
+                    header_rows = tbl[:6]
+                    col_headers = []
+                    for c_idx in range(max_cols):
+                        bits = []
+                        for row in header_rows:
+                            if c_idx < len(row) and row[c_idx]:
+                                bits.append(str(row[c_idx]).lower().replace("\n", " "))
+                        col_headers.append(" ".join(bits))
+
+                    for row in header_rows:
+                        if not row:
+                            continue
                         row_txt = " ".join([str(x).lower().replace('\n', ' ') for x in row if x])
-                        
+
                         if "paid through itc" in row_txt or "payment of tax" in row_txt:
                             is_6_1 = True
-                            
-                        for c_idx, cell in enumerate(row):
-                            if cell and "net tax payable" in str(cell).lower().replace('\n', ' '):
-                                net_col_idx = c_idx
+
+                    for c_idx, header_txt in enumerate(col_headers):
+                        if "net tax payable" in header_txt:
+                            net_col_idx = c_idx
                     
-                    # Ignore Table 3.1 or any other tables
+                    def choose_tax_col(keywords):
+                        # Prefer columns under "paid through ITC"; otherwise keep first matched tax column.
+                        candidates = []
+                        for c_idx, header_txt in enumerate(col_headers):
+                            if all(k in header_txt for k in keywords):
+                                candidates.append((c_idx, header_txt))
+                        if not candidates:
+                            return -1
+                        itc_candidates = [c for c in candidates if "itc" in c[1] or "paid through itc" in c[1]]
+                        selected = (itc_candidates[0] if itc_candidates else candidates[0])[0]
+                        return selected
+
+                    igst_col_idx = choose_tax_col(["integrated", "tax"])
+                    cgst_col_idx = choose_tax_col(["central", "tax"])
+                    sgst_col_idx = choose_tax_col(["tax"])  # refined below to state/ut only
+                    if sgst_col_idx != -1:
+                        if not ("state/ut" in col_headers[sgst_col_idx] or "state tax" in col_headers[sgst_col_idx] or "ut tax" in col_headers[sgst_col_idx]):
+                            sgst_col_idx = -1
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = choose_tax_col(["state/ut", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = choose_tax_col(["state", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = choose_tax_col(["ut", "tax"])
+
+                    # Ignore Table 3.1 or other tables
                     if not is_6_1:
                         continue
-                        
-                    table_found = True
-                        
-                    # HUMAN BLUEPRINT FALLBACK: As you explained, if header parsing fails, it's the 4th column (Index 3)
+
+                    # Fallback for old layouts with contiguous tax columns
                     if net_col_idx == -1:
                         net_col_idx = 3
-                        
-                    # 2. Extract Data from specific columns
+                    if igst_col_idx == -1:
+                        igst_col_idx = net_col_idx + 1
+                    if cgst_col_idx == -1:
+                        cgst_col_idx = net_col_idx + 2
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = net_col_idx + 3
+
+                    def parse_val(val):
+                        if val is None:
+                            return 0.0
+                        raw = str(val).strip()
+                        if raw in ("", "-", "NA", "na", "N/A"):
+                            return 0.0
+                        neg = raw.startswith("(") and raw.endswith(")")
+                        cleaned = re.sub(r"[^0-9.\-]", "", raw)
+                        if cleaned in ("", "-", ".", "-."):
+                            return 0.0
+                        try:
+                            num = float(cleaned)
+                            return -num if neg and num > 0 else num
+                        except ValueError:
+                            return 0.0
+
+                    def col_val(row, idx):
+                        if idx < 0 or idx >= len(row):
+                            return 0.0
+                        return parse_val(row[idx])
+
+                    # 2) Extract values from tax rows
                     for row in tbl:
-                        if not row: continue
-                        
-                        # Combine first two cells to catch the description (in case there's an S.No column)
-                        desc = str(row[0]).lower().replace('\n', ' ')
-                        if len(row) > 1:
-                            desc += " " + str(row[1]).lower().replace('\n', ' ')
-                            
+                        if not row:
+                            continue
+
+                        # Join all text cells to detect row labels even if description column shifts.
+                        desc = " ".join(
+                            str(cell).lower().replace("\n", " ")
+                            for cell in row if cell is not None
+                        )
+
                         is_igst = "integrated" in desc and "tax" in desc
                         is_cgst = "central" in desc and "tax" in desc and "integrated" not in desc
                         is_sgst = ("state" in desc or "ut" in desc) and "tax" in desc
-                        
+
                         if not (is_igst or is_cgst or is_sgst):
                             continue
-                            
-                        # Safety check: Ensure row has enough columns
-                        if len(row) <= net_col_idx + 3:
-                            continue
-                            
-                        def parse_val(val):
-                            if not val: return 0.0
-                            # Fix broken numbers inside cells (e.g. 602750.0 \n 0 -> 602750.00)
-                            v = str(val).replace(",", "").replace("\n", "").replace(" ", "").strip()
-                            if v in ("-", "NA", "", "0", "0.0", "0.00"): return 0.0
-                            try: return float(v)
-                            except ValueError: return 0.0
-                            
-                        # Grabs exactly the 4th, 5th, 6th, and 7th columns as you detailed!
-                        val_net  = parse_val(row[net_col_idx])
-                        val_igst = parse_val(row[net_col_idx + 1])
-                        val_cgst = parse_val(row[net_col_idx + 2])
-                        val_sgst = parse_val(row[net_col_idx + 3])
-                        
+
+                        numeric_cells = [(i, parse_val(v)) for i, v in enumerate(row)]
+                        numeric_cells = [(i, v) for i, v in numeric_cells if v != 0.0]
+
+                        val_net = col_val(row, net_col_idx)
+                        val_igst = col_val(row, igst_col_idx)
+                        val_cgst = col_val(row, cgst_col_idx)
+                        val_sgst = col_val(row, sgst_col_idx)
+
+                        # Row-aware fallback: if mapped paid-tax cell is zero, use the first
+                        # non-zero value found to the right of Net Payable in the same row.
+                        right_vals = [v for i, v in numeric_cells if i > net_col_idx]
+                        row_paid_fallback = right_vals[0] if right_vals else 0.0
+                        if is_igst and val_igst == 0.0:
+                            val_igst = row_paid_fallback
+                        if is_cgst and val_cgst == 0.0:
+                            val_cgst = row_paid_fallback
+                        if is_sgst and val_sgst == 0.0:
+                            val_sgst = row_paid_fallback
+
                         net_payable += val_net
-                        paid_igst += val_igst
-                        paid_cgst += val_cgst
-                        paid_sgst += val_sgst
+                        if is_igst:
+                            paid_igst += val_igst
+                        if is_cgst:
+                            paid_cgst += val_cgst
+                        if is_sgst:
+                            paid_sgst += val_sgst
 
     except Exception:
         pass
