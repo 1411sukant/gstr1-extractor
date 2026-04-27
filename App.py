@@ -151,6 +151,32 @@ def extract_6_1A(file):
                     for c_idx, header_txt in enumerate(col_headers):
                         if "net tax payable" in header_txt:
                             net_col_idx = c_idx
+
+                    itc_anchor = next((i for i, h in enumerate(col_headers) if "paid through itc" in h), -1)
+                    cash_anchor = next((i for i, h in enumerate(col_headers) if "paid in cash" in h), -1)
+
+                    def match_col(header_txt: str, labels: list) -> bool:
+                        return all(label in header_txt for label in labels)
+
+                    def pick_tax_col(labels: list) -> int:
+                        candidates = [i for i, h in enumerate(col_headers) if match_col(h, labels)]
+                        if not candidates:
+                            return -1
+                        # Prefer the candidate that belongs to ITC block if anchors are available.
+                        if itc_anchor != -1:
+                            upper = cash_anchor if (cash_anchor != -1 and cash_anchor > itc_anchor) else len(col_headers)
+                            itc_block = [i for i in candidates if itc_anchor <= i < upper]
+                            if itc_block:
+                                return itc_block[0]
+                        return candidates[0]
+
+                    igst_col_idx = pick_tax_col(["integrated", "tax"])
+                    cgst_col_idx = pick_tax_col(["central", "tax"])
+                    sgst_col_idx = pick_tax_col(["state/ut", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = pick_tax_col(["state", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = pick_tax_col(["ut", "tax"])
                         if "integrated tax" in header_txt:
                             igst_col_idx = c_idx
                         if "central tax" in header_txt:
