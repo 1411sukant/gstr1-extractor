@@ -177,6 +177,12 @@ def extract_6_1A(file):
                         sgst_col_idx = pick_tax_col(["state", "tax"])
                     if sgst_col_idx == -1:
                         sgst_col_idx = pick_tax_col(["ut", "tax"])
+                        if "integrated tax" in header_txt:
+                            igst_col_idx = c_idx
+                        if "central tax" in header_txt:
+                            cgst_col_idx = c_idx
+                        if "state/ut tax" in header_txt or "state tax" in header_txt or "ut tax" in header_txt:
+                            sgst_col_idx = c_idx
 
                     # Ignore Table 3.1 or other tables
                     if not is_6_1:
