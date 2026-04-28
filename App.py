@@ -159,20 +159,21 @@ if uploaded_files:
                     )
                     total_cdn = cdn_reg + cdn_unreg
 
-                    # ── 5. AMENDMENT (9A) — net differential ─────────────────
-                    # 9A has multiple sub-sections; we sum all "Net differential" lines
+                    # ── 5. AMENDMENT (9A) — Amended amount Total ──────────
+                    # Uses "Amended amount - Total" not "Net differential"
+                    # because Net differential is 0 when original value unchanged
                     amendment_9a = 0.0
-                    for nd_match in re.finditer(
-                        r'Net\s+differential\s+amount.*?([\d,]+\.\d{2})',
-                        full_text, re.IGNORECASE
-                    ):
-                        # only inside 9A section (before 9B)
-                        pos = nd_match.start()
-                        sec_9a = re.search(r'9A\s*[-–]?\s*Amendment', full_text, re.IGNORECASE)
-                        sec_9b = re.search(r'9B\s*[-–]?\s*Credit', full_text, re.IGNORECASE)
-                        if sec_9a and (not sec_9b or pos < sec_9b.start()) and pos > sec_9a.start():
-                            val = float(nd_match.group(1).replace(',', ''))
-                            amendment_9a += val
+                    sec_9a = re.search(r'9A\s*[-–]?\s*Amendment', full_text, re.IGNORECASE)
+                    sec_9b = re.search(r'9B\s*[-–]?\s*Credit',    full_text, re.IGNORECASE)
+                    if sec_9a:
+                        chunk_9a = full_text[sec_9a.start(): sec_9b.start() if sec_9b else sec_9a.start() + 5000]
+                        for m in re.finditer(r'Amended\s+amount\s*[-–]?\s*Total', chunk_9a, re.IGNORECASE):
+                            snippet = chunk_9a[m.start(): m.start() + 300]
+                            amounts = re.findall(r'-?[\d,]+\.\d{2}', snippet)
+                            if amounts:
+                                val = float(amounts[0].replace(',', ''))
+                                if val != 0.0:
+                                    amendment_9a += val
 
                     # ── 6. TAX LIABILITY ──────────────────────────────────────
                     igst, cgst, sgst = extract_liability(full_text)
