@@ -158,6 +158,27 @@ def extract_6_1A(file):
                     def match_col(header_txt: str, labels: list) -> bool:
                         return all(label in header_txt for label in labels)
 
+                    def find_tax_candidates(labels: list) -> list:
+                        candidates = [i for i, h in enumerate(col_headers) if match_col(h, labels)]
+                        if itc_anchor != -1:
+                            upper = cash_anchor if (cash_anchor != -1 and cash_anchor > itc_anchor) else len(col_headers)
+                            itc_block = [i for i in candidates if itc_anchor <= i < upper]
+                            non_itc_block = [i for i in candidates if i not in itc_block]
+                            return itc_block + non_itc_block
+                        return candidates
+
+                    igst_cols = find_tax_candidates(["integrated", "tax"])
+                    cgst_cols = find_tax_candidates(["central", "tax"])
+                    sgst_cols = find_tax_candidates(["state/ut", "tax"])
+                    igst_col_idx = igst_cols[0] if igst_cols else -1
+                    cgst_col_idx = cgst_cols[0] if cgst_cols else -1
+                    sgst_col_idx = sgst_cols[0] if sgst_cols else -1
+                    if sgst_col_idx == -1:
+                        sgst_cols = find_tax_candidates(["state", "tax"])
+                        sgst_col_idx = sgst_cols[0] if sgst_cols else -1
+                    if sgst_col_idx == -1:
+                        sgst_cols = find_tax_candidates(["ut", "tax"])
+                        sgst_col_idx = sgst_cols[0] if sgst_cols else -1
                     def pick_tax_col(labels: list) -> int:
                         candidates = [i for i, h in enumerate(col_headers) if match_col(h, labels)]
                         if not candidates:
