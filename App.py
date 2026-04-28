@@ -160,6 +160,11 @@ def extract_6_1A(file):
 
                     def find_tax_candidates(labels: list) -> list:
                         candidates = [i for i, h in enumerate(col_headers) if match_col(h, labels)]
+                    def pick_tax_col(labels: list) -> int:
+                        candidates = [i for i, h in enumerate(col_headers) if match_col(h, labels)]
+                        if not candidates:
+                            return -1
+                        # Prefer the candidate that belongs to ITC block if anchors are available.
                         if itc_anchor != -1:
                             upper = cash_anchor if (cash_anchor != -1 and cash_anchor > itc_anchor) else len(col_headers)
                             itc_block = [i for i in candidates if itc_anchor <= i < upper]
@@ -179,6 +184,22 @@ def extract_6_1A(file):
                     if sgst_col_idx == -1:
                         sgst_cols = find_tax_candidates(["ut", "tax"])
                         sgst_col_idx = sgst_cols[0] if sgst_cols else -1
+                                return itc_block[0]
+                        return candidates[0]
+
+                    igst_col_idx = pick_tax_col(["integrated", "tax"])
+                    cgst_col_idx = pick_tax_col(["central", "tax"])
+                    sgst_col_idx = pick_tax_col(["state/ut", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = pick_tax_col(["state", "tax"])
+                    if sgst_col_idx == -1:
+                        sgst_col_idx = pick_tax_col(["ut", "tax"])
+                        if "integrated tax" in header_txt:
+                            igst_col_idx = c_idx
+                        if "central tax" in header_txt:
+                            cgst_col_idx = c_idx
+                        if "state/ut tax" in header_txt or "state tax" in header_txt or "ut tax" in header_txt:
+                            sgst_col_idx = c_idx
 
                     # Ignore Table 3.1 or other tables
                     if not is_6_1:
@@ -239,6 +260,9 @@ def extract_6_1A(file):
                         if not (is_igst or is_cgst or is_sgst):
                             continue
 
+                        numeric_cells = [(i, parse_val(v)) for i, v in enumerate(row)]
+                        numeric_cells = [(i, v) for i, v in numeric_cells if v != 0.0]
+
                         val_net = col_val(row, net_col_idx)
                         val_igst = col_val(row, igst_col_idx)
                         val_cgst = col_val(row, cgst_col_idx)
@@ -253,6 +277,24 @@ def extract_6_1A(file):
                         paid_igst += val_igst
                         paid_cgst += val_cgst
                         paid_sgst += val_sgst
+                        # Row-aware fallback: if mapped paid-tax cell is zero, use the first
+                        # non-zero value found to the right of Net Payable in the same row.
+                        right_vals = [v for i, v in numeric_cells if i > net_col_idx]
+                        row_paid_fallback = right_vals[0] if right_vals else 0.0
+                        if is_igst and val_igst == 0.0:
+                            val_igst = row_paid_fallback
+                        if is_cgst and val_cgst == 0.0:
+                            val_cgst = row_paid_fallback
+                        if is_sgst and val_sgst == 0.0:
+                            val_sgst = row_paid_fallback
+
+                        net_payable += val_net
+                        if is_igst:
+                            paid_igst += val_igst
+                        if is_cgst:
+                            paid_cgst += val_cgst
+                        if is_sgst:
+                            paid_sgst += val_sgst
 
     except Exception:
         pass
